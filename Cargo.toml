@@ -1,0 +1,21 @@
+[package]
+name = "zs2fast"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "zs2fast"
+crate-type = ["cdylib"]   # for Python extension
+
+[dependencies]
+pyo3 = { version = "0.21", features = ["extension-module"] }
+flate2 = "1"
+thiserror = "1"
+# Arrow/Parquet: keep versions aligned
+arrow = "53"
+parquet = "53"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "thin"
