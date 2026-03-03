@@ -29,19 +29,25 @@ enum Zs2Error {
 
 type Res<T> = Result<T, Zs2Error>;
 
+impl From<Zs2Error> for PyErr {
+    fn from(err: Zs2Error) -> PyErr {
+        pyo3::exceptions::PyRuntimeError::new_err(err.to_string())
+    }
+}
+
 #[pyfunction]
 fn zs2_to_parquet(input_zs2: &str, output_parquet: &str, include_u32: Option<bool>) -> PyResult<()> {
     let include_u32 = include_u32.unwrap_or(false);
 
     // 1) Decompress gz (.zs2 is gzipped)
-    let f = File::open(input_zs2).map_err(|e| PyErr::from(Zs2Error::Io(e)))?;
+    let f = File::open(input_zs2)?;
     let mut gz = GzDecoder::new(BufReader::new(f));
     let mut data = Vec::<u8>::new();
-    gz.read_to_end(&mut data).map_err(|e| PyErr::from(Zs2Error::Io(e)))?;
+    gz.read_to_end(&mut data)?;
 
     // 2) Quick sanity: 0xDE AD BE AF (little-endian u32 -> bytes: AF BE AD DE)
     if data.len() < 4 || data[0..4] != [0xAF, 0xBE, 0xAD, 0xDE] {
-        return Err(PyErr::from(Zs2Error::BadMarker));
+        return Err(Zs2Error::BadMarker.into());
     }
 
     // 3) Scan stream
@@ -60,9 +66,7 @@ fn zs2_to_parquet(input_zs2: &str, output_parquet: &str, include_u32: Option<boo
     while i < n {
         // 0xFF means "end of nesting" with no name
         if data[i] == 0xFF {
-            if let Some(_) = name_stack.pop() {
-                // end one level
-            }
+            name_stack.pop();
             i += 1;
             continue;
         }
@@ -158,7 +162,7 @@ fn zs2_to_parquet(input_zs2: &str, output_parquet: &str, include_u32: Option<boo
                         // We don't know the unit size; bail gracefully by not advancing beyond bounds.
                         return Err(Zs2Error::Parse {
                             offset: i,
-                            msg: format!("Unknown EE subtype 0x{:04X}", sub)
+                            msg: format!("Unknown EE subtype 0x{sub:04X}")
                         }.into());
                     }
                 }
@@ -201,21 +205,21 @@ fn zs2_to_parquet(input_zs2: &str, output_parquet: &str, include_u32: Option<boo
             0xCC => { i += 1 + 8; }
 
             _ => {
-                return Err(PyErr::from(Zs2Error::Parse {
+                return Err(Zs2Error::Parse {
                     offset: i,
-                    msg: format!("Unknown data type tag 0x{:02X} for name {}", dtype, name)
-                }));
+                    msg: format!("Unknown data type tag 0x{dtype:02X} for name {name}")
+                }.into());
             }
         }
     }
 
     // 4) Build Arrow table
-    let schema = Schema::new(vec![
+    let schema = std::sync::Arc::new(Schema::new(vec![
         Field::new("series", DataType::Utf8, false),
         Field::new("subtype", DataType::Utf8, false),
         Field::new("index", DataType::UInt32, false),
         Field::new("value", DataType::Float64, false),
-    ]);
+    ]));
 
     let a_series: ArrayRef = std::sync::Arc::new(b_series.finish());
     let a_subtyp: ArrayRef = std::sync::Arc::new(b_subtyp.finish());
@@ -223,16 +227,16 @@ fn zs2_to_parquet(input_zs2: &str, output_parquet: &str, include_u32: Option<boo
     let a_value : ArrayRef = std::sync::Arc::new(b_value.finish());
 
     let batch = RecordBatch::try_new(
-        std::sync::Arc::new(schema.clone()),
+        std::sync::Arc::clone(&schema),
         vec![a_series, a_subtyp, a_index, a_value]
-    ).map_err(PyErr::from)?;
+    )?;
 
     // 5) Write Parquet
-    let file = File::create(output_parquet).map_err(|e| PyErr::from(Zs2Error::Io(e)))?;
+    let file = File::create(output_parquet)?;
     let props = WriterProperties::builder().build();
-    let mut writer = ArrowWriter::try_new(file, std::sync::Arc::new(schema), Some(props)).map_err(PyErr::from)?;
-    writer.write(&batch).map_err(PyErr::from)?;
-    writer.close().map_err(PyErr::from)?;
+    let mut writer = ArrowWriter::try_new(file, std::sync::Arc::clone(&schema), Some(props))?;
+    writer.write(&batch)?;
+    writer.close()?;
 
     Ok(())
 }
@@ -242,7 +246,7 @@ fn ensure_len(want: usize, n: usize, at: usize) -> Res<()> {
     if want > n {
         return Err(Zs2Error::Parse {
             offset: at,
-            msg: format!("unexpected EOF (need {}, have {})", want, n),
+            msg: format!("unexpected EOF (need {want}, have {n})"),
         });
     }
     Ok(())
