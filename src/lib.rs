@@ -36,6 +36,7 @@ impl From<Zs2Error> for PyErr {
 }
 
 #[pyfunction]
+#[pyo3(signature = (input_zs2, output_parquet, include_u32=None))]
 fn zs2_to_parquet(
     input_zs2: &str,
     output_parquet: &str,
