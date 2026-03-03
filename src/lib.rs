@@ -276,9 +276,8 @@ fn zs2_to_parquet(
     // 5) Write Parquet
     let file = File::create(output_parquet)?;
     let props = WriterProperties::builder().build();
-    let mut writer =
-        ArrowWriter::try_new(file, std::sync::Arc::clone(&schema), Some(props))
-            .map_err(|e| Zs2Error::from(e))?;
+    let mut writer = ArrowWriter::try_new(file, std::sync::Arc::clone(&schema), Some(props))
+        .map_err(|e| Zs2Error::from(e))?;
     writer.write(&batch).map_err(|e| Zs2Error::from(e))?;
     writer.close().map_err(|e| Zs2Error::from(e))?;
 
