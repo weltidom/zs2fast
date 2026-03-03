@@ -109,10 +109,10 @@ fn zs2_to_parquet(input_zs2: &str, output_parquet: &str, include_u32: Option<boo
                         for idx in 0..cnt {
                             let off = i + idx*4;
                             let v = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as f64;
-                            b_series.append_value(&series)?;
-                            b_subtyp.append_value("EE04")?;
-                            b_index.append_value(idx as u32)?;
-                            b_value.append_value(v)?;
+                            b_series.append_value(&series);
+                            b_subtyp.append_value("EE04");
+                            b_index.append_value(idx as u32);
+                            b_value.append_value(v);
                         }
                         i += need;
                     }
@@ -125,10 +125,10 @@ fn zs2_to_parquet(input_zs2: &str, output_parquet: &str, include_u32: Option<boo
                                 data[off], data[off+1], data[off+2], data[off+3],
                                 data[off+4], data[off+5], data[off+6], data[off+7]
                             ]);
-                            b_series.append_value(&series)?;
-                            b_subtyp.append_value("EE05")?;
-                            b_index.append_value(idx as u32)?;
-                            b_value.append_value(v)?;
+                            b_series.append_value(&series);
+                            b_subtyp.append_value("EE05");
+                            b_index.append_value(idx as u32);
+                            b_value.append_value(v);
                         }
                         i += need;
                     }
@@ -139,10 +139,10 @@ fn zs2_to_parquet(input_zs2: &str, output_parquet: &str, include_u32: Option<boo
                             for idx in 0..cnt {
                                 let off = i + idx*4;
                                 let v = u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as f64;
-                                b_series.append_value(&series)?;
-                                b_subtyp.append_value("EE16")?;
-                                b_index.append_value(idx as u32)?;
-                                b_value.append_value(v)?;
+                                b_series.append_value(&series);
+                                b_subtyp.append_value("EE16");
+                                b_index.append_value(idx as u32);
+                                b_value.append_value(v);
                             }
                         }
                         i += need;
