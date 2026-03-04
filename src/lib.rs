@@ -301,8 +301,16 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
     let n = data.len();
 
     // ===== PASS 1: Extract parameter dictionary and channel mappings =====
-    let mut param_names: HashMap<u32, String> = HashMap::new(); // elem_idx -> name
-    let mut unit_names: HashMap<u32, String> = HashMap::new(); // elem_idx -> unit name
+    #[derive(Default)]
+    struct ParamDictEntry {
+        param_id: Option<u32>,
+        short_name: String,
+        param_name: String,
+        unit_name: String,
+    }
+    
+    let mut eig_dict_by_elem: HashMap<u32, ParamDictEntry> = HashMap::new();
+    let mut cm_dict_by_elem: HashMap<u32, ParamDictEntry> = HashMap::new();
     let mut channel_trs_ids: HashMap<String, u32> = HashMap::new(); // "sample_{s}/ch_{idx}" -> TrsChannelId
     let mut samples_seen: Vec<u32> = Vec::new(); // list of sample indices found
 
@@ -331,6 +339,14 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
 
         let dtype = data[i];
         let path = name_stack.join("/") + "/" + &name;
+        let is_eigenschaftenliste = path.contains("/EigenschaftenListe/");
+        let is_channel_manager = path.contains("/SeriesDef/TestTaskDefs/")
+            && path.contains("/ChannelManager/ChannelManager/Elem");
+        let elem_idx_opt = if is_eigenschaftenliste || is_channel_manager {
+            extract_elem_index(&path)
+        } else {
+            None
+        };
 
         match dtype {
             0xEE => {
@@ -341,15 +357,27 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                 let cnt = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                 i += 4;
 
-                // Extract parameter IDs and names from EigenschaftenListe
-                if path.contains("/EigenschaftenListe/") && path.contains("/ID") {
-                    if sub == 0x0016 && cnt >= 1 {
-                        let need = cnt as usize * 4;
-                        ensure_len(i + need, n, i)?;
-                        let _param_id = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
-                        i += need;
-                        continue;
+                // Extract parameter IDs from EigenschaftenListe
+                if is_eigenschaftenliste && path.ends_with("/ID") && sub == 0x0016 && cnt >= 1 {
+                    let need = cnt as usize * 4;
+                    ensure_len(i + need, n, i)?;
+                    let param_id = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                    if let Some(elem_idx) = elem_idx_opt {
+                        eig_dict_by_elem.entry(elem_idx).or_default().param_id = Some(param_id);
                     }
+                    i += need;
+                    continue;
+                }
+
+                if is_channel_manager && path.ends_with("/ID") && sub == 0x0016 && cnt >= 1 {
+                    let need = cnt as usize * 4;
+                    ensure_len(i + need, n, i)?;
+                    let param_id = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                    if let Some(elem_idx) = elem_idx_opt {
+                        cm_dict_by_elem.entry(elem_idx).or_default().param_id = Some(param_id);
+                    }
+                    i += need;
+                    continue;
                 }
 
                 // Skip array data
@@ -373,19 +401,61 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                 ensure_len(i + need, n, i)?;
 
                 // Extract parameter names from Name/Text in EigenschaftenListe
-                if path.contains("/EigenschaftenListe/") && path.contains("/Name/Text") {
+                if is_eigenschaftenliste && path.ends_with("/Name/Text") {
                     if let Ok(text) = decode_utf16le(&data[i..i + need]) {
-                        if let Some(elem_idx) = extract_elem_index(&path) {
-                            param_names.insert(elem_idx, text);
+                        if let Some(elem_idx) = elem_idx_opt {
+                            eig_dict_by_elem.entry(elem_idx).or_default().param_name = text;
                         }
                     }
                 }
 
-                // Extract unit names from EinheitName in EigenschaftenListe (0xAA directly, not nested)
-                if path.contains("/EigenschaftenListe/") && path.ends_with("/EinheitName") {
+                if is_eigenschaftenliste && path.ends_with("/Kurzzeichen/Text") {
                     if let Ok(text) = decode_utf16le(&data[i..i + need]) {
-                        if let Some(elem_idx) = extract_elem_index(&path) {
-                            unit_names.insert(elem_idx, text);
+                        if let Some(elem_idx) = elem_idx_opt {
+                            eig_dict_by_elem.entry(elem_idx).or_default().short_name = text;
+                        }
+                    }
+                }
+
+                // Extract unit names from EinheitName in EigenschaftenListe
+                if is_eigenschaftenliste && path.ends_with("/EinheitName") {
+                    if let Ok(text) = decode_utf16le(&data[i..i + need]) {
+                        if let Some(elem_idx) = elem_idx_opt {
+                            eig_dict_by_elem.entry(elem_idx).or_default().unit_name = text;
+                        }
+                    }
+                }
+
+                if is_channel_manager && path.ends_with("/Name/Text") {
+                    if let Ok(text) = decode_utf16le(&data[i..i + need]) {
+                        if let Some(elem_idx) = elem_idx_opt {
+                            cm_dict_by_elem.entry(elem_idx).or_default().param_name = text;
+                        }
+                    }
+                }
+
+                if is_channel_manager && path.ends_with("/Kurzzeichen/Text") {
+                    if let Ok(text) = decode_utf16le(&data[i..i + need]) {
+                        if let Some(elem_idx) = elem_idx_opt {
+                            cm_dict_by_elem.entry(elem_idx).or_default().short_name = text;
+                        }
+                    }
+                }
+
+                if is_channel_manager && path.ends_with("/UnitTableName") {
+                    if let Ok(text) = decode_utf16le(&data[i..i + need]) {
+                        if let Some(elem_idx) = elem_idx_opt {
+                            cm_dict_by_elem.entry(elem_idx).or_default().unit_name = text;
+                        }
+                    }
+                }
+
+                // Extract actual unit symbols from Einheit/Kurzzeichen in ChannelManager
+                if is_channel_manager && path.ends_with("/Einheit/Kurzzeichen") {
+                    if let Ok(text) = decode_utf16le(&data[i..i + need]) {
+                        if let Some(elem_idx) = elem_idx_opt {
+                            // Override UnitTableName with actual unit symbol
+                            cm_dict_by_elem.entry(elem_idx).or_default().unit_name = text;
                         }
                     }
                 }
@@ -407,7 +477,7 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                 if path.contains("/DataChannels/") && path.contains("/TrsChannelId") {
                     ensure_len(i + 1 + 4, n, i)?;
                     i += 1;
-                    let trs_id = data[i] as u32; // Read byte value as TrsChannelId
+                    let trs_id = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                     i += 4;
 
                     if let Some(sample_idx) = extract_sample_index(&path) {
@@ -423,8 +493,44 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                     i += 1 + 4;
                 }
             }
-            0x22 | 0x33 | 0x44 => i += 1 + 4,
-            0x55 | 0x66 => i += 1 + 2,
+            0x22 | 0x33 | 0x44 => {
+                // Extract ID from scalar u32/i32/f32 in EigenschaftenListe
+                ensure_len(i + 1 + 4, n, i)?;
+                i += 1;
+                let raw_u32 = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                i += 4;
+                
+                if is_eigenschaftenliste && path.ends_with("/ID") {
+                    if let Some(elem_idx) = elem_idx_opt {
+                        eig_dict_by_elem.entry(elem_idx).or_default().param_id = Some(raw_u32);
+                    }
+                }
+
+                if is_channel_manager && path.ends_with("/ID") {
+                    if let Some(elem_idx) = elem_idx_opt {
+                        cm_dict_by_elem.entry(elem_idx).or_default().param_id = Some(raw_u32);
+                    }
+                }
+            }
+            0x55 | 0x66 => {
+                // Extract ID from scalar u16 in EigenschaftenListe
+                ensure_len(i + 1 + 2, n, i)?;
+                i += 1;
+                let raw_u16 = u16::from_le_bytes([data[i], data[i + 1]]);
+                i += 2;
+                
+                if is_eigenschaftenliste && path.ends_with("/ID") {
+                    if let Some(elem_idx) = elem_idx_opt {
+                        eig_dict_by_elem.entry(elem_idx).or_default().param_id = Some(raw_u16 as u32);
+                    }
+                }
+
+                if is_channel_manager && path.ends_with("/ID") {
+                    if let Some(elem_idx) = elem_idx_opt {
+                        cm_dict_by_elem.entry(elem_idx).or_default().param_id = Some(raw_u16 as u32);
+                    }
+                }
+            }
             0x88 | 0x99 => i += 1 + 1,
             0xBB => i += 1 + 4,
             0xCC => i += 1 + 8,
@@ -438,10 +544,83 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
         }
     }
 
-    // ===== Build inverse mapping: TrsChannelId -> name =====
-    let trs_to_name: HashMap<u32, String> = param_names.clone();
+    // ===== Build inverse mapping: param_id -> (name, unit) =====
+    let mut trs_to_name: HashMap<u32, String> = HashMap::new();
+    let mut trs_to_unit: HashMap<u32, String> = HashMap::new();
 
-    // No need for second pass - we already have param_names from first pass by elem_idx
+    // Build UnitTableName -> unit symbol mapping (e.g. UT_Displacement -> mm)
+    // from EigenschaftenListe text fields.
+    let mut unit_table_to_symbol: HashMap<String, String> = HashMap::new();
+    for entry in eig_dict_by_elem.values() {
+        let unit = entry.unit_name.trim();
+        if unit.is_empty() {
+            continue;
+        }
+
+        let short_key = entry.short_name.trim();
+        if !short_key.is_empty() {
+            unit_table_to_symbol
+                .entry(short_key.to_string())
+                .or_insert_with(|| unit.to_string());
+        }
+
+        let name_key = entry.param_name.trim();
+        if !name_key.is_empty() {
+            unit_table_to_symbol
+                .entry(name_key.to_string())
+                .or_insert_with(|| unit.to_string());
+        }
+    }
+
+    // Process ChannelManager first for names (using actual channel names from ChannelManager)
+    for (_, entry) in cm_dict_by_elem {
+        if let Some(param_id) = entry.param_id {
+            let name = if !entry.param_name.trim().is_empty() {
+                entry.param_name
+            } else {
+                entry.short_name
+            };
+            trs_to_name.insert(param_id, name);
+            // Use resolved UnitTableName when available (e.g. UT_Force -> N).
+            let mut resolved_unit = unit_table_to_symbol
+                .get(entry.unit_name.trim())
+                .cloned()
+                .unwrap_or(entry.unit_name);
+            if resolved_unit.starts_with("UT_") {
+                if let Some(symbol) = infer_unit_from_unit_table_name(&resolved_unit) {
+                    resolved_unit = symbol.to_string();
+                }
+            }
+            trs_to_unit.entry(param_id).or_insert(resolved_unit);
+        }
+    }
+
+    // Process EigenschaftenListe last for units - these have actual unit symbols (N, mm, s, etc.)
+    // and should override the UnitTableName values from ChannelManager
+    for (_, entry) in eig_dict_by_elem {
+        if let Some(param_id) = entry.param_id {
+            let name = if !entry.param_name.trim().is_empty() {
+                entry.param_name
+            } else {
+                entry.short_name
+            };
+            // Keep the channel name from ChannelManager if it exists (it's more descriptive)
+            trs_to_name.entry(param_id).or_insert(name);
+            // Override with EigenschaftenListe unit if available (actual unit symbols)
+            if !entry.unit_name.trim().is_empty() {
+                let mut resolved_unit = unit_table_to_symbol
+                    .get(entry.unit_name.trim())
+                    .cloned()
+                    .unwrap_or(entry.unit_name);
+                if resolved_unit.starts_with("UT_") {
+                    if let Some(symbol) = infer_unit_from_unit_table_name(&resolved_unit) {
+                        resolved_unit = symbol.to_string();
+                    }
+                }
+                trs_to_unit.insert(param_id, resolved_unit);
+            }
+        }
+    }
 
     // ===== PASS 2: Extract channel data with semantic names =====
     i = 4;
@@ -518,7 +697,7 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
 
                     // Look up unit name from TrsChannelId -> unit_names
                     let unit = if let Some(tid) = trs_id {
-                        let explicit = unit_names
+                        let explicit = trs_to_unit
                             .get(&tid)
                             .cloned()
                             .unwrap_or_default();
@@ -1559,6 +1738,21 @@ fn infer_unit_from_channel_name(channel_name: &str) -> &'static str {
         "index"
     } else {
         ""
+    }
+}
+
+fn infer_unit_from_unit_table_name(unit_table_name: &str) -> Option<&'static str> {
+    match unit_table_name {
+        "UT_Displacement" | "UT_Length" => Some("mm"),
+        "UT_Force" => Some("N"),
+        "UT_Force/Area" | "UT_Stress" => Some("MPa"),
+        "UT_Time" => Some("s"),
+        "UT_Temperature" => Some("°C"),
+        "UT_Velocity" => Some("mm/s"),
+        "UT_Force/Time" => Some("N/s"),
+        "UT_Strain/Time" => Some("1/s"),
+        "UT_NoUnit" => Some(""),
+        _ => None,
     }
 }
 
