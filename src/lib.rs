@@ -356,27 +356,6 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                     }
                 }
 
-                // Extract TrsChannelId mappings from DataChannels  
-                if path.contains("/DataChannels/") && path.contains("/TrsChannelId") {
-                    if sub == 0x0016 && cnt >= 1 {
-                        let need = cnt as usize * 4;
-                        ensure_len(i + need, n, i)?;
-                        let trs_id = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
-                        i += need;
-
-                        if let Some(sample_idx) = extract_sample_index(&path) {
-                            if let Some(ch_idx) = extract_data_channel_index(&path) {
-                                if !samples_seen.contains(&sample_idx) {
-                                    samples_seen.push(sample_idx);
-                                }
-                                let key = format!("sample_{}/ch_{}", sample_idx, ch_idx);
-                                channel_trs_ids.insert(key, trs_id);
-                            }
-                        }
-                        continue;
-                    }
-                }
-
                 // Skip array data
                 let bytes_per_item = match sub {
                     0x0004 | 0x0016 | 0x0005 => if sub == 0x0005 { 8 } else { 4 },
@@ -421,7 +400,28 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
             }
 
             0xFF => i += 1,
-            0x11 | 0x22 | 0x33 | 0x44 => i += 1 + 4,
+            0x11 => {
+                // Extract TrsChannelId mappings from DataChannels (0x11 is a scalar byte)
+                if path.contains("/DataChannels/") && path.contains("/TrsChannelId") {
+                    ensure_len(i + 1 + 4, n, i)?;
+                    i += 1;
+                    let trs_id = data[i] as u32; // Read byte value as TrsChannelId
+                    i += 4;
+
+                    if let Some(sample_idx) = extract_sample_index(&path) {
+                        if let Some(ch_idx) = extract_data_channel_index(&path) {
+                            if !samples_seen.contains(&sample_idx) {
+                                samples_seen.push(sample_idx);
+                            }
+                            let key = format!("sample_{}/ch_{}", sample_idx, ch_idx);
+                            channel_trs_ids.insert(key, trs_id);
+                        }
+                    }
+                } else {
+                    i += 1 + 4;
+                }
+            }
+            0x22 | 0x33 | 0x44 => i += 1 + 4,
             0x55 | 0x66 => i += 1 + 2,
             0x88 | 0x99 => i += 1 + 1,
             0xBB => i += 1 + 4,
@@ -437,132 +437,9 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
     }
 
     // ===== Build inverse mapping: TrsChannelId -> name =====
-    let mut trs_to_name: HashMap<u32, String> = HashMap::new();
+    let trs_to_name: HashMap<u32, String> = param_names.clone();
 
-    // Re-scan for ID/Name pairs (second selective pass)
-    i = 4;
-    name_stack.clear();
-    let mut last_param_id: Option<u32> = None;
-
-    while i < n {
-        if data[i] == 0xFF {
-            if !name_stack.is_empty() {
-                name_stack.pop();
-            }
-            i += 1;
-            continue;
-        }
-
-        ensure_len(i + 1, n, i)?;
-        let name_len = data[i] as usize;
-        i += 1;
-        ensure_len(i + name_len, n, i)?;
-        let name = str::from_utf8(&data[i..i + name_len])?.to_string();
-        i += name_len;
-
-        if i >= n {
-            break;
-        }
-
-        let dtype = data[i];
-        let path = name_stack.join("/") + "/" + &name;
-
-        if path.contains("/EigenschaftenListe/") {
-
-            if path.contains("/ID") && dtype == 0xEE {
-                ensure_len(i + 7, n, i)?;
-                i += 1;
-                let sub = u16::from_le_bytes([data[i], data[i + 1]]);
-                i += 2;
-                let cnt = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
-                i += 4;
-
-                if sub == 0x0016 && cnt >= 1 {
-                    let param_id = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
-                    last_param_id = Some(param_id);
-                    i += 4;
-                } else {
-                    let bytes_per_item = match sub {
-                        0x0004 | 0x0016 | 0x0005 => if sub == 0x0005 { 8 } else { 4 },
-                        0x0011 => 1,
-                        _ => 0,
-                    };
-                    let need = (cnt as usize) * bytes_per_item;
-                    ensure_len(i + need, n, i)?;
-                    i += need;
-                }
-                continue;
-            }
-
-            if path.contains("/Name/Text") && dtype == 0xAA || dtype == 0x00 {
-                ensure_len(i + 1 + 4, n, i)?;
-                i += 1;
-                let raw = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
-                i += 4;
-                let char_count = (raw & 0x7FFF_FFFF) as usize;
-                let need = char_count * 2;
-                ensure_len(i + need, n, i)?;
-
-                if let Ok(text) = decode_utf16le(&data[i..i + need]) {
-                    if let Some(param_id) = last_param_id {
-                        trs_to_name.insert(param_id, text);
-                    }
-                }
-                i += need;
-                continue;
-            }
-
-            if dtype == 0xDD {
-                ensure_len(i + 2, n, i)?;
-                let len = data[i + 1] as usize;
-                ensure_len(i + 2 + len, n, i)?;
-                i += 2 + len;
-                name_stack.push(name);
-                continue;
-            }
-        }
-
-        match dtype {
-            0xEE => {
-                ensure_len(i + 1 + 2 + 4, n, i)?;
-                i += 1;
-                let sub = u16::from_le_bytes([data[i], data[i + 1]]);
-                i += 2;
-                let cnt = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
-                i += 4;
-                let bytes_per_item = match sub {
-                    0x0004 | 0x0016 | 0x0005 => if sub == 0x0005 { 8 } else { 4 },
-                    0x0011 => 1,
-                    _ => 0,
-                };
-                let need = (cnt as usize) * bytes_per_item;
-                ensure_len(i + need, n, i)?;
-                i += need;
-            }
-            0xAA | 0x00 => {
-                ensure_len(i + 1 + 4, n, i)?;
-                i += 1;
-                let raw = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
-                i += 4;
-                let char_count = (raw & 0x7FFF_FFFF) as usize;
-                i += char_count * 2;
-            }
-            0xDD => {
-                ensure_len(i + 2, n, i)?;
-                let len = data[i + 1] as usize;
-                ensure_len(i + 2 + len, n, i)?;
-                i += 2 + len;
-                name_stack.push(name);
-            }
-            0xFF => i += 1,
-            0x11 | 0x22 | 0x33 | 0x44 => i += 1 + 4,
-            0x55 | 0x66 => i += 1 + 2,
-            0x88 | 0x99 => i += 1 + 1,
-            0xBB => i += 1 + 4,
-            0xCC => i += 1 + 8,
-            _ => break,
-        }
-    }
+    // No need for second pass - we already have param_names from first pass by elem_idx
 
     // ===== PASS 2: Extract channel data with semantic names =====
     i = 4;
