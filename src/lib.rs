@@ -301,7 +301,8 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
     let n = data.len();
 
     // ===== PASS 1: Extract parameter dictionary and channel mappings =====
-    let mut param_names: HashMap<u32, String> = HashMap::new(); // id -> name
+    let mut param_names: HashMap<u32, String> = HashMap::new(); // elem_idx -> name
+    let mut unit_names: HashMap<u32, String> = HashMap::new(); // elem_idx -> unit name
     let mut channel_trs_ids: HashMap<String, u32> = HashMap::new(); // "sample_{s}/ch_{idx}" -> TrsChannelId
     let mut samples_seen: Vec<u32> = Vec::new(); // list of sample indices found
 
@@ -345,13 +346,8 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                     if sub == 0x0016 && cnt >= 1 {
                         let need = cnt as usize * 4;
                         ensure_len(i + need, n, i)?;
-                        let param_id = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                        let _param_id = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                         i += need;
-
-                        // Look for corresponding Name field in same Elem
-                        if extract_elem_index(&path).is_some() {
-                            // Will be matched with Name/Text in second pass
-                        }
                         continue;
                     }
                 }
@@ -380,10 +376,16 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                 if path.contains("/EigenschaftenListe/") && path.contains("/Name/Text") {
                     if let Ok(text) = decode_utf16le(&data[i..i + need]) {
                         if let Some(elem_idx) = extract_elem_index(&path) {
-                            // Match this text with the previous ID we saw in this Elem
-                            // For simplicity, store by a derived key
-                            let key = format!("param_name_{}", elem_idx);
                             param_names.insert(elem_idx, text);
+                        }
+                    }
+                }
+
+                // Extract unit names from EinheitName in EigenschaftenListe (0xAA directly, not nested)
+                if path.contains("/EigenschaftenListe/") && path.ends_with("/EinheitName") {
+                    if let Ok(text) = decode_utf16le(&data[i..i + need]) {
+                        if let Some(elem_idx) = extract_elem_index(&path) {
+                            unit_names.insert(elem_idx, text);
                         }
                     }
                 }
@@ -448,6 +450,7 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
     let mut sample_idx_builder = UInt32Builder::new();
     let mut channel_idx_builder = UInt32Builder::new();
     let mut channel_name_builder = StringBuilder::new();
+    let mut unit_name_builder = StringBuilder::new();
     let mut timepoint_builder = UInt32Builder::new();
     let mut value_builder = Float64Builder::new();
     let mut data_type_builder = StringBuilder::new();
@@ -513,6 +516,16 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                         format!("Ch{}", ch_idx)
                     };
 
+                    // Look up unit name from TrsChannelId -> unit_names
+                    let unit = if let Some(tid) = trs_id {
+                        unit_names
+                            .get(&tid)
+                            .cloned()
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+
                     // Extract values
                     for (tp, chunk) in blob.chunks(bytes_per_item).enumerate() {
                         let value = match sub {
@@ -554,6 +567,7 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                             sample_idx_builder.append_value(sample_idx);
                             channel_idx_builder.append_value(ch_idx);
                             channel_name_builder.append_value(&ch_name);
+                            unit_name_builder.append_value(&unit);
                             timepoint_builder.append_value(tp as u32);
                             value_builder.append_value(value);
                             data_type_builder.append_value(data_type_name);
@@ -613,6 +627,7 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
         Field::new("sample_idx", DataType::UInt32, false),
         Field::new("channel_idx", DataType::UInt32, false),
         Field::new("channel_name", DataType::Utf8, false),
+        Field::new("unit", DataType::Utf8, true),
         Field::new("timepoint", DataType::UInt32, false),
         Field::new("value", DataType::Float64, true),
         Field::new("data_type", DataType::Utf8, false),
@@ -624,6 +639,7 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
             std::sync::Arc::new(sample_idx_builder.finish()),
             std::sync::Arc::new(channel_idx_builder.finish()),
             std::sync::Arc::new(channel_name_builder.finish()),
+            std::sync::Arc::new(unit_name_builder.finish()),
             std::sync::Arc::new(timepoint_builder.finish()),
             std::sync::Arc::new(value_builder.finish()),
             std::sync::Arc::new(data_type_builder.finish()),
