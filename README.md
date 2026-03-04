@@ -32,34 +32,30 @@ pip install zs2fast
 
 ```python
 import zs2fast
+import polars as pl
 
 # Convert a .zs2 file to Parquet
 zs2fast.zs2_to_parquet("input.zs2", "output.parquet", include_u32=False)
 
-# Inspect available channels and decoded UTF-16 metadata
-catalog = zs2fast.zs2_channel_catalog("input.zs2")
-# rows: (series, subtype, count, metadata)
-print(catalog[:5])
-
-# Extract evaluated per-sample parameters with semantic names
-params = zs2fast.zs2_evaluated_params("input.zs2")
-# rows: (sample_idx, param_id, short_name, param_name, value)
-print(params[:10])
-
-# Extract evaluated parameters including optional text/enum values
-params_rich = zs2fast.zs2_evaluated_params_with_text("input.zs2")
-# rows: (sample_idx, param_id, short_name, param_name, value, value_text)
-print(params_rich[:10])
+# Export channel time-series to Parquet
+zs2fast.zs2_channels_to_parquet("input.zs2", "channels.parquet")
+# parquet columns: sample_idx, channel_idx, channel_name, unit, timepoint, value, data_type
+channels = pl.read_parquet("channels.parquet")
+print(channels.head())
 
 # Export evaluated parameters directly to Parquet
 zs2fast.zs2_evaluated_params_to_parquet("input.zs2", "evaluated_params.parquet")
 # parquet columns: sample_idx, param_id, short_name, param_name, value, value_text
+params = pl.read_parquet("evaluated_params.parquet")
+print(params.head())
 
 # Extract per-sample test results from:
 # .../Series/SeriesElements/Elem{s}/.../EvalContext/ParamContext/ParameterListe/Elem{p}
 # useful for values like Zugscherfestigkeit / Bruchbild
 zs2fast.zs2_parameterliste_results_to_parquet("input.zs2", "sample_results.parquet")
 # parquet columns: sample_id, result_id, result_name, unit, value_text, value
+results = pl.read_parquet("sample_results.parquet")
+print(results.head())
 ```
 
 ## Development
