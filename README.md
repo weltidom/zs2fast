@@ -60,9 +60,6 @@ zs2fast.zs2_evaluated_params_to_parquet("input.zs2", "evaluated_params.parquet")
 # useful for values like Zugscherfestigkeit / Bruchbild
 zs2fast.zs2_parameterliste_results_to_parquet("input.zs2", "sample_results.parquet")
 # parquet columns: sample_id, result_id, result_name, unit, value_text, value
-
-# Backward-compatible alias (same output)
-zs2fast.zs2_shear_test_results_to_parquet("input.zs2", "sample_results.parquet")
 ```
 
 ## Development

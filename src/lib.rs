@@ -1546,12 +1546,6 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
     Ok(())
 }
 
-/// Backward-compatible alias for existing notebooks/scripts.
-#[pyfunction]
-fn zs2_shear_test_results_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()> {
-    zs2_parameterliste_results_to_parquet(input_zs2, output_parquet)
-}
-
 fn infer_unit_from_channel_name(channel_name: &str) -> &'static str {
     let lower = channel_name.to_lowercase();
 
@@ -1574,6 +1568,5 @@ fn zs2fast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(zs2_channels_to_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(zs2_evaluated_params_to_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(zs2_parameterliste_results_to_parquet, m)?)?;
-    m.add_function(wrap_pyfunction!(zs2_shear_test_results_to_parquet, m)?)?;
     Ok(())
 }
