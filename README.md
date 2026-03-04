@@ -35,6 +35,25 @@ import zs2fast
 
 # Convert a .zs2 file to Parquet
 zs2fast.zs2_to_parquet("input.zs2", "output.parquet", include_u32=False)
+
+# Inspect available channels and decoded UTF-16 metadata
+catalog = zs2fast.zs2_channel_catalog("input.zs2")
+# rows: (series, subtype, count, metadata)
+print(catalog[:5])
+
+# Extract evaluated per-sample parameters with semantic names
+params = zs2fast.zs2_evaluated_params("input.zs2")
+# rows: (sample_idx, param_id, short_name, param_name, value)
+print(params[:10])
+
+# Extract evaluated parameters including optional text/enum values
+params_rich = zs2fast.zs2_evaluated_params_with_text("input.zs2")
+# rows: (sample_idx, param_id, short_name, param_name, value, value_text)
+print(params_rich[:10])
+
+# Export evaluated parameters directly to Parquet
+zs2fast.zs2_evaluated_params_to_parquet("input.zs2", "evaluated_params.parquet")
+# parquet columns: sample_idx, param_id, short_name, param_name, value, value_text
 ```
 
 ## Development

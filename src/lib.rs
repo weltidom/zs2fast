@@ -3,6 +3,7 @@ use pyo3::prelude::*;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::str;
+use std::collections::HashMap;
 use thiserror::Error;
 
 use arrow::array::{ArrayRef, Float64Builder, StringBuilder, UInt32Builder};
@@ -285,6 +286,484 @@ fn zs2_to_parquet(
     Ok(())
 }
 
+#[pyfunction]
+fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()> {
+    // 1) Decompress
+    let f = File::open(input_zs2)?;
+    let mut gz = GzDecoder::new(BufReader::new(f));
+    let mut data = Vec::<u8>::new();
+    gz.read_to_end(&mut data)?;
+
+    if data.len() < 4 || data[0..4] != [0xAF, 0xBE, 0xAD, 0xDE] {
+        return Err(Zs2Error::BadMarker.into());
+    }
+
+    let n = data.len();
+
+    // ===== PASS 1: Extract parameter dictionary and channel mappings =====
+    let mut param_names: HashMap<u32, String> = HashMap::new(); // id -> name
+    let mut channel_trs_ids: HashMap<String, u32> = HashMap::new(); // "sample_{s}/ch_{idx}" -> TrsChannelId
+    let mut samples_seen: Vec<u32> = Vec::new(); // list of sample indices found
+
+    let mut i = 4usize;
+    let mut name_stack: Vec<String> = Vec::with_capacity(8);
+
+    while i < n {
+        if data[i] == 0xFF {
+            if !name_stack.is_empty() {
+                name_stack.pop();
+            }
+            i += 1;
+            continue;
+        }
+
+        ensure_len(i + 1, n, i)?;
+        let name_len = data[i] as usize;
+        i += 1;
+        ensure_len(i + name_len, n, i)?;
+        let name = str::from_utf8(&data[i..i + name_len])?.to_string();
+        i += name_len;
+
+        if i >= n {
+            break;
+        }
+
+        let dtype = data[i];
+        let path = name_stack.join("/") + "/" + &name;
+
+        match dtype {
+            0xEE => {
+                ensure_len(i + 1 + 2 + 4, n, i)?;
+                i += 1;
+                let sub = u16::from_le_bytes([data[i], data[i + 1]]);
+                i += 2;
+                let cnt = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                i += 4;
+
+                // Extract parameter IDs and names from EigenschaftenListe
+                if path.contains("/EigenschaftenListe/") && path.contains("/ID") {
+                    if sub == 0x0016 && cnt >= 1 {
+                        let need = cnt as usize * 4;
+                        ensure_len(i + need, n, i)?;
+                        let param_id = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                        i += need;
+
+                        // Look for corresponding Name field in same Elem
+                        if extract_elem_index(&path).is_some() {
+                            // Will be matched with Name/Text in second pass
+                        }
+                        continue;
+                    }
+                }
+
+                // Extract TrsChannelId mappings from DataChannels  
+                if path.contains("/DataChannels/") && path.contains("/TrsChannelId") {
+                    if sub == 0x0016 && cnt >= 1 {
+                        let need = cnt as usize * 4;
+                        ensure_len(i + need, n, i)?;
+                        let trs_id = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                        i += need;
+
+                        if let Some(sample_idx) = extract_sample_index(&path) {
+                            if let Some(ch_idx) = extract_data_channel_index(&path) {
+                                if !samples_seen.contains(&sample_idx) {
+                                    samples_seen.push(sample_idx);
+                                }
+                                let key = format!("sample_{}/ch_{}", sample_idx, ch_idx);
+                                channel_trs_ids.insert(key, trs_id);
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                // Skip array data
+                let bytes_per_item = match sub {
+                    0x0004 | 0x0016 | 0x0005 => if sub == 0x0005 { 8 } else { 4 },
+                    0x0011 => 1usize,
+                    _ => 0usize,
+                };
+                let need = (cnt as usize) * bytes_per_item;
+                ensure_len(i + need, n, i)?;
+                i += need;
+            }
+
+            0xAA | 0x00 => {
+                ensure_len(i + 1 + 4, n, i)?;
+                i += 1;
+                let raw = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                i += 4;
+                let char_count = (raw & 0x7FFF_FFFF) as usize;
+                let need = char_count * 2;
+                ensure_len(i + need, n, i)?;
+
+                // Extract parameter names from Name/Text in EigenschaftenListe
+                if path.contains("/EigenschaftenListe/") && path.contains("/Name/Text") {
+                    if let Ok(text) = decode_utf16le(&data[i..i + need]) {
+                        if let Some(elem_idx) = extract_elem_index(&path) {
+                            // Match this text with the previous ID we saw in this Elem
+                            // For simplicity, store by a derived key
+                            let key = format!("param_name_{}", elem_idx);
+                            param_names.insert(elem_idx, text);
+                        }
+                    }
+                }
+
+                i += need;
+            }
+
+            0xDD => {
+                ensure_len(i + 2, n, i)?;
+                let len = data[i + 1] as usize;
+                ensure_len(i + 2 + len, n, i)?;
+                i += 2 + len;
+                name_stack.push(name);
+            }
+
+            0xFF => i += 1,
+            0x11 | 0x22 | 0x33 | 0x44 => i += 1 + 4,
+            0x55 | 0x66 => i += 1 + 2,
+            0x88 | 0x99 => i += 1 + 1,
+            0xBB => i += 1 + 4,
+            0xCC => i += 1 + 8,
+            _ => {
+                return Err(Zs2Error::Parse {
+                    offset: i,
+                    msg: format!("Unknown data type tag 0x{dtype:02X}"),
+                }
+                .into())
+            }
+        }
+    }
+
+    // ===== Build inverse mapping: TrsChannelId -> name =====
+    let mut trs_to_name: HashMap<u32, String> = HashMap::new();
+
+    // Re-scan for ID/Name pairs (second selective pass)
+    i = 4;
+    name_stack.clear();
+    let mut last_param_id: Option<u32> = None;
+
+    while i < n {
+        if data[i] == 0xFF {
+            if !name_stack.is_empty() {
+                name_stack.pop();
+            }
+            i += 1;
+            continue;
+        }
+
+        ensure_len(i + 1, n, i)?;
+        let name_len = data[i] as usize;
+        i += 1;
+        ensure_len(i + name_len, n, i)?;
+        let name = str::from_utf8(&data[i..i + name_len])?.to_string();
+        i += name_len;
+
+        if i >= n {
+            break;
+        }
+
+        let dtype = data[i];
+        let path = name_stack.join("/") + "/" + &name;
+
+        if path.contains("/EigenschaftenListe/") {
+
+            if path.contains("/ID") && dtype == 0xEE {
+                ensure_len(i + 7, n, i)?;
+                i += 1;
+                let sub = u16::from_le_bytes([data[i], data[i + 1]]);
+                i += 2;
+                let cnt = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                i += 4;
+
+                if sub == 0x0016 && cnt >= 1 {
+                    let param_id = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                    last_param_id = Some(param_id);
+                    i += 4;
+                } else {
+                    let bytes_per_item = match sub {
+                        0x0004 | 0x0016 | 0x0005 => if sub == 0x0005 { 8 } else { 4 },
+                        0x0011 => 1,
+                        _ => 0,
+                    };
+                    let need = (cnt as usize) * bytes_per_item;
+                    ensure_len(i + need, n, i)?;
+                    i += need;
+                }
+                continue;
+            }
+
+            if path.contains("/Name/Text") && dtype == 0xAA || dtype == 0x00 {
+                ensure_len(i + 1 + 4, n, i)?;
+                i += 1;
+                let raw = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                i += 4;
+                let char_count = (raw & 0x7FFF_FFFF) as usize;
+                let need = char_count * 2;
+                ensure_len(i + need, n, i)?;
+
+                if let Ok(text) = decode_utf16le(&data[i..i + need]) {
+                    if let Some(param_id) = last_param_id {
+                        trs_to_name.insert(param_id, text);
+                    }
+                }
+                i += need;
+                continue;
+            }
+
+            if dtype == 0xDD {
+                ensure_len(i + 2, n, i)?;
+                let len = data[i + 1] as usize;
+                ensure_len(i + 2 + len, n, i)?;
+                i += 2 + len;
+                name_stack.push(name);
+                continue;
+            }
+        }
+
+        match dtype {
+            0xEE => {
+                ensure_len(i + 1 + 2 + 4, n, i)?;
+                i += 1;
+                let sub = u16::from_le_bytes([data[i], data[i + 1]]);
+                i += 2;
+                let cnt = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                i += 4;
+                let bytes_per_item = match sub {
+                    0x0004 | 0x0016 | 0x0005 => if sub == 0x0005 { 8 } else { 4 },
+                    0x0011 => 1,
+                    _ => 0,
+                };
+                let need = (cnt as usize) * bytes_per_item;
+                ensure_len(i + need, n, i)?;
+                i += need;
+            }
+            0xAA | 0x00 => {
+                ensure_len(i + 1 + 4, n, i)?;
+                i += 1;
+                let raw = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                i += 4;
+                let char_count = (raw & 0x7FFF_FFFF) as usize;
+                i += char_count * 2;
+            }
+            0xDD => {
+                ensure_len(i + 2, n, i)?;
+                let len = data[i + 1] as usize;
+                ensure_len(i + 2 + len, n, i)?;
+                i += 2 + len;
+                name_stack.push(name);
+            }
+            0xFF => i += 1,
+            0x11 | 0x22 | 0x33 | 0x44 => i += 1 + 4,
+            0x55 | 0x66 => i += 1 + 2,
+            0x88 | 0x99 => i += 1 + 1,
+            0xBB => i += 1 + 4,
+            0xCC => i += 1 + 8,
+            _ => break,
+        }
+    }
+
+    // ===== PASS 2: Extract channel data with semantic names =====
+    i = 4;
+    name_stack.clear();
+
+    let mut sample_idx_builder = UInt32Builder::new();
+    let mut channel_idx_builder = UInt32Builder::new();
+    let mut channel_name_builder = StringBuilder::new();
+    let mut timepoint_builder = UInt32Builder::new();
+    let mut value_builder = Float64Builder::new();
+    let mut data_type_builder = StringBuilder::new();
+
+    while i < n {
+        if data[i] == 0xFF {
+            if !name_stack.is_empty() {
+                name_stack.pop();
+            }
+            i += 1;
+            continue;
+        }
+
+        ensure_len(i + 1, n, i)?;
+        let name_len = data[i] as usize;
+        i += 1;
+        ensure_len(i + name_len, n, i)?;
+        let name = str::from_utf8(&data[i..i + name_len])?.to_string();
+        i += name_len;
+
+        if i >= n {
+            break;
+        }
+
+        let dtype = data[i];
+        let path = name_stack.join("/") + "/" + &name;
+
+        if dtype == 0xEE {
+            ensure_len(i + 1 + 2 + 4, n, i)?;
+            i += 1;
+            let sub = u16::from_le_bytes([data[i], data[i + 1]]);
+            i += 2;
+            let cnt = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+            i += 4;
+
+            // Check if this is a real-time capture channel
+            if path.contains("/DataChannels/") && path.contains("RealTimeCapture/Trs/SingleGroupDataBlock") {
+                if let (Some(sample_idx), Some(ch_idx)) = (
+                    extract_sample_index(&path),
+                    extract_data_channel_index(&path),
+                ) {
+                    let (data_type_name, bytes_per_item) = match sub {
+                        0x0004 => ("f32", 4usize),
+                        0x0005 => ("f64", 8usize),
+                        0x0016 => ("u32", 4usize),
+                        0x0011 => ("u8", 1usize),
+                        _ => ("unknown", 0usize),
+                    };
+
+                    let need = (cnt as usize) * bytes_per_item;
+                    ensure_len(i + need, n, i)?;
+                    let blob = &data[i..i + need];
+
+                    // Look up channel name from TrsChannelId
+                    let key = format!("sample_{}/ch_{}", sample_idx, ch_idx);
+                    let trs_id = channel_trs_ids.get(&key).copied();
+                    let ch_name = if let Some(tid) = trs_id {
+                        trs_to_name
+                            .get(&tid)
+                            .cloned()
+                            .unwrap_or_else(|| format!("Ch{}", ch_idx))
+                    } else {
+                        format!("Ch{}", ch_idx)
+                    };
+
+                    // Extract values
+                    for (tp, chunk) in blob.chunks(bytes_per_item).enumerate() {
+                        let value = match sub {
+                            0x0004 => {
+                                if chunk.len() >= 4 {
+                                    f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f64
+                                } else {
+                                    f64::NAN
+                                }
+                            }
+                            0x0005 => {
+                                if chunk.len() >= 8 {
+                                    f64::from_le_bytes([
+                                        chunk[0], chunk[1], chunk[2], chunk[3],
+                                        chunk[4], chunk[5], chunk[6], chunk[7],
+                                    ])
+                                } else {
+                                    f64::NAN
+                                }
+                            }
+                            0x0016 => {
+                                if chunk.len() >= 4 {
+                                    u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f64
+                                } else {
+                                    f64::NAN
+                                }
+                            }
+                            0x0011 => {
+                                if !chunk.is_empty() {
+                                    chunk[0] as f64
+                                } else {
+                                    f64::NAN
+                                }
+                            }
+                            _ => f64::NAN,
+                        };
+
+                        if value.is_finite() {
+                            sample_idx_builder.append_value(sample_idx);
+                            channel_idx_builder.append_value(ch_idx);
+                            channel_name_builder.append_value(&ch_name);
+                            timepoint_builder.append_value(tp as u32);
+                            value_builder.append_value(value);
+                            data_type_builder.append_value(data_type_name);
+                        }
+                    }
+
+                    i += need;
+                    continue;
+                }
+            }
+
+            // Skip non-channel data
+            let bytes_per_item = match sub {
+                0x0004 | 0x0016 | 0x0005 => if sub == 0x0005 { 8 } else { 4 },
+                0x0011 => 1,
+                _ => 0,
+            };
+            let need = (cnt as usize) * bytes_per_item;
+            ensure_len(i + need, n, i)?;
+            i += need;
+        } else if dtype == 0xAA || dtype == 0x00 {
+            ensure_len(i + 1 + 4, n, i)?;
+            i += 1;
+            let raw = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+            i += 4;
+            let char_count = (raw & 0x7FFF_FFFF) as usize;
+            let need = char_count * 2;
+            ensure_len(i + need, n, i)?;
+            i += need;
+        } else if dtype == 0xDD {
+            ensure_len(i + 2, n, i)?;
+            let len = data[i + 1] as usize;
+            ensure_len(i + 2 + len, n, i)?;
+            i += 2 + len;
+            name_stack.push(name);
+        } else {
+            match dtype {
+                0xFF => i += 1,
+                0x11 | 0x22 | 0x33 | 0x44 => i += 1 + 4,
+                0x55 | 0x66 => i += 1 + 2,
+                0x88 | 0x99 => i += 1 + 1,
+                0xBB => i += 1 + 4,
+                0xCC => i += 1 + 8,
+                _ => {
+                    return Err(Zs2Error::Parse {
+                        offset: i,
+                        msg: format!("Unknown data type tag 0x{dtype:02X}"),
+                    }
+                    .into())
+                }
+            }
+        }
+    }
+
+    // Build and write Parquet
+    let schema = std::sync::Arc::new(Schema::new(vec![
+        Field::new("sample_idx", DataType::UInt32, false),
+        Field::new("channel_idx", DataType::UInt32, false),
+        Field::new("channel_name", DataType::Utf8, false),
+        Field::new("timepoint", DataType::UInt32, false),
+        Field::new("value", DataType::Float64, true),
+        Field::new("data_type", DataType::Utf8, false),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::clone(&schema),
+        vec![
+            std::sync::Arc::new(sample_idx_builder.finish()),
+            std::sync::Arc::new(channel_idx_builder.finish()),
+            std::sync::Arc::new(channel_name_builder.finish()),
+            std::sync::Arc::new(timepoint_builder.finish()),
+            std::sync::Arc::new(value_builder.finish()),
+            std::sync::Arc::new(data_type_builder.finish()),
+        ],
+    )
+    .map_err(Zs2Error::from)?;
+
+    let file = File::create(output_parquet)?;
+    let props = WriterProperties::builder().build();
+    let mut writer = ArrowWriter::try_new(file, std::sync::Arc::clone(&schema), Some(props))
+        .map_err(Zs2Error::from)?;
+    writer.write(&batch).map_err(Zs2Error::from)?;
+    writer.close().map_err(Zs2Error::from)?;
+
+    Ok(())
+}
+
 #[inline]
 fn ensure_len(want: usize, n: usize, at: usize) -> Res<()> {
     if want > n {
@@ -296,8 +775,61 @@ fn ensure_len(want: usize, n: usize, at: usize) -> Res<()> {
     Ok(())
 }
 
+fn extract_sample_index(path: &str) -> Option<u32> {
+    if let Some(start) = path.find("/SeriesElements/Elem") {
+        let rest = &path[start + 20..];
+        if let Some(end) = rest.find('/') {
+            if let Ok(idx) = rest[..end].parse::<u32>() {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+fn extract_data_channel_index(path: &str) -> Option<u32> {
+    if let Some(start) = path.find("/DataChannels/Elem") {
+        let rest = &path[start + 18..];
+        if let Some(end) = rest.find('/') {
+            if let Ok(idx) = rest[..end].parse::<u32>() {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+fn extract_elem_index(path: &str) -> Option<u32> {
+    if let Some(start) = path.find("/Elem") {
+        let rest = &path[start + 5..];
+        if let Some(end) = rest.find('/') {
+            if let Ok(idx) = rest[..end].parse::<u32>() {
+                return Some(idx);
+            }
+        } else if let Ok(idx) = rest.parse::<u32>() {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn decode_utf16le(bytes: &[u8]) -> Res<String> {
+    if bytes.len() % 2 != 0 {
+        return Ok(String::new());
+    }
+    let mut result = String::new();
+    for chunk in bytes.chunks_exact(2) {
+        let code_point = u16::from_le_bytes([chunk[0], chunk[1]]);
+        if let Some(c) = char::from_u32(code_point as u32) {
+            result.push(c);
+        }
+    }
+    Ok(result.trim_end_matches('\0').to_string())
+}
+
 #[pymodule]
 fn zs2fast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(zs2_to_parquet, m)?)?;
+    m.add_function(wrap_pyfunction!(zs2_channels_to_parquet, m)?)?;
     Ok(())
 }
