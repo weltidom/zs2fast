@@ -54,6 +54,15 @@ print(params_rich[:10])
 # Export evaluated parameters directly to Parquet
 zs2fast.zs2_evaluated_params_to_parquet("input.zs2", "evaluated_params.parquet")
 # parquet columns: sample_idx, param_id, short_name, param_name, value, value_text
+
+# Extract per-sample test results from:
+# .../Series/SeriesElements/Elem{s}/.../EvalContext/ParamContext/ParameterListe/Elem{p}
+# useful for values like Zugscherfestigkeit / Bruchbild
+zs2fast.zs2_parameterliste_results_to_parquet("input.zs2", "sample_results.parquet")
+# parquet columns: sample_id, result_id, result_name, unit, value_text, value
+
+# Backward-compatible alias (same output)
+zs2fast.zs2_shear_test_results_to_parquet("input.zs2", "sample_results.parquet")
 ```
 
 ## Development

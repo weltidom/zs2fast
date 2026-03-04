@@ -675,14 +675,21 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
     }
 
     #[derive(Default)]
-    struct ParamData {
-        name: String,
-        unit: String,
-        value_text: Option<String>,
-        value_numeric: Option<f64>,
+    struct DictEntry {
+        param_id: Option<u32>,
+        short_name: String,
+        param_name: String,
     }
 
-    let mut params: HashMap<u32, ParamData> = HashMap::new();
+    #[derive(Default)]
+    struct SampleParam {
+        param_id: Option<u32>,
+        value_numeric: Option<f64>,
+        value_text: Option<String>,
+    }
+
+    let mut dict_by_elem: HashMap<u32, DictEntry> = HashMap::new();
+    let mut sample_params: HashMap<(u32, u32), SampleParam> = HashMap::new();
 
     let mut i = 4usize;
     let n = data.len();
@@ -710,6 +717,10 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
 
         let dtype = data[i];
         let path = name_stack.join("/") + "/" + &name;
+        let leaf = path.rsplit('/').next().unwrap_or("");
+        let sample_key = extract_direct_sample_parameter_key(&path);
+        let in_global_dict = path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/");
+        let dict_elem_idx = if in_global_dict { extract_elem_index(&path) } else { None };
 
         match dtype {
             0xAA | 0x00 => {
@@ -723,36 +734,12 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
                 let text = decode_utf16le(&data[i..i + need])?;
                 i += need;
 
-                if let Some(elem_idx) = extract_elem_index(&path) {
-                    if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/")
-                        && path.ends_with("/Name/Text")
-                    {
-                        params.entry(elem_idx).or_default().name = text;
-                    } else if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/")
-                        && path.ends_with("/EinheitName")
-                    {
-                        params.entry(elem_idx).or_default().unit = text;
-                    } else if path.contains("/Evaluation/PrivateContext/EigenschaftenListe/")
-                        && path.ends_with("/Name/Text")
-                    {
-                        let trimmed = text.trim();
-                        if !trimmed.is_empty() {
-                            let entry = params.entry(elem_idx).or_default();
-
-                            let normalized = trimmed.replace(',', ".");
-                            if let Ok(v) = normalized.parse::<f64>() {
-                                entry.value_numeric = Some(v);
-                            }
-
-                            let replace_text = match &entry.value_text {
-                                None => true,
-                                Some(existing) if existing.starts_with('#') && !trimmed.starts_with('#') => true,
-                                Some(_) => false,
-                            };
-                            if replace_text {
-                                entry.value_text = Some(trimmed.to_string());
-                            }
-                        }
+                if let Some(elem_idx) = dict_elem_idx {
+                    let entry = dict_by_elem.entry(elem_idx).or_default();
+                    if path.ends_with("/Name/Text") {
+                        entry.param_name = text.trim().to_string();
+                    } else if path.ends_with("/Kurzzeichen/Text") {
+                        entry.short_name = text.trim().to_string();
                     }
                 }
             }
@@ -760,12 +747,22 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
             0x22 => {
                 ensure_len(i + 1 + 4, n, i)?;
                 i += 1;
+                let raw_u32 = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                 let val = i32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as f64;
                 i += 4;
 
-                if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/") {
-                    if let Some(elem_idx) = extract_elem_index(&path) {
-                        params.entry(elem_idx).or_default().value_numeric = Some(val);
+                if in_global_dict && path.ends_with("/ID") {
+                    if let Some(elem_idx) = dict_elem_idx {
+                        dict_by_elem.entry(elem_idx).or_default().param_id = Some(raw_u32);
+                    }
+                }
+
+                if let Some((s_idx, p_idx)) = sample_key {
+                    let entry = sample_params.entry((s_idx, p_idx)).or_default();
+                    if leaf == "ID" {
+                        entry.param_id = Some(raw_u32);
+                    } else if is_likely_value_leaf(leaf) {
+                        entry.value_numeric = Some(val);
                     }
                 }
             }
@@ -776,9 +773,12 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
                 let val = f32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as f64;
                 i += 4;
 
-                if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/") {
-                    if let Some(elem_idx) = extract_elem_index(&path) {
-                        params.entry(elem_idx).or_default().value_numeric = Some(val);
+                if let Some((s_idx, p_idx)) = sample_key {
+                    let entry = sample_params.entry((s_idx, p_idx)).or_default();
+                    if leaf == "ID" {
+                        entry.param_id = Some(val as u32);
+                    } else if is_likely_value_leaf(leaf) {
+                        entry.value_numeric = Some(val);
                     }
                 }
             }
@@ -792,9 +792,12 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
                 ]);
                 i += 8;
 
-                if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/") {
-                    if let Some(elem_idx) = extract_elem_index(&path) {
-                        params.entry(elem_idx).or_default().value_numeric = Some(val);
+                if let Some((s_idx, p_idx)) = sample_key {
+                    let entry = sample_params.entry((s_idx, p_idx)).or_default();
+                    if leaf == "ID" {
+                        entry.param_id = Some(val as u32);
+                    } else if is_likely_value_leaf(leaf) {
+                        entry.value_numeric = Some(val);
                     }
                 }
             }
@@ -823,11 +826,83 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
                 };
                 let need = (cnt as usize) * bytes_per_item;
                 ensure_len(i + need, n, i)?;
+
+                if sub == 0x0016 && cnt >= 1 && need >= 4 && leaf == "ID" {
+                    let raw_u32 = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+
+                    if in_global_dict {
+                        if let Some(elem_idx) = dict_elem_idx {
+                            dict_by_elem.entry(elem_idx).or_default().param_id = Some(raw_u32);
+                        }
+                    }
+
+                    if let Some((s_idx, p_idx)) = sample_key {
+                        sample_params.entry((s_idx, p_idx)).or_default().param_id = Some(raw_u32);
+                    }
+                }
+
+                if let Some((s_idx, p_idx)) = sample_key {
+                    if sub == 0x0011 {
+                        let blob = &data[i..i + need];
+                        let entry = sample_params.entry((s_idx, p_idx)).or_default();
+                        if leaf == "QS_ValPar" {
+                            if entry.value_numeric.is_none() {
+                                entry.value_numeric = decode_qs_valpar_f64(blob);
+                            }
+                        } else if leaf == "QS_TextPar" {
+                            if entry.value_text.is_none() {
+                                entry.value_text = decode_qs_textpar(blob);
+                            }
+                        }
+                    }
+                }
+
                 i += need;
             }
 
-            0x11 | 0x33 => i += 1 + 4,
-            0x55 | 0x66 => i += 1 + 2,
+            0x11 | 0x33 => {
+                ensure_len(i + 1 + 4, n, i)?;
+                i += 1;
+                let raw_u32 = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                let val = raw_u32 as f64;
+                i += 4;
+
+                if in_global_dict && path.ends_with("/ID") {
+                    if let Some(elem_idx) = dict_elem_idx {
+                        dict_by_elem.entry(elem_idx).or_default().param_id = Some(raw_u32);
+                    }
+                }
+
+                if let Some((s_idx, p_idx)) = sample_key {
+                    let entry = sample_params.entry((s_idx, p_idx)).or_default();
+                    if leaf == "ID" {
+                        entry.param_id = Some(raw_u32);
+                    } else if is_likely_value_leaf(leaf) {
+                        entry.value_numeric = Some(val);
+                    }
+                }
+            }
+            0x55 | 0x66 => {
+                ensure_len(i + 1 + 2, n, i)?;
+                i += 1;
+                let raw_u16 = u16::from_le_bytes([data[i], data[i + 1]]);
+                i += 2;
+
+                if in_global_dict && path.ends_with("/ID") {
+                    if let Some(elem_idx) = dict_elem_idx {
+                        dict_by_elem.entry(elem_idx).or_default().param_id = Some(raw_u16 as u32);
+                    }
+                }
+
+                if let Some((s_idx, p_idx)) = sample_key {
+                    let entry = sample_params.entry((s_idx, p_idx)).or_default();
+                    if leaf == "ID" {
+                        entry.param_id = Some(raw_u16 as u32);
+                    } else if is_likely_value_leaf(leaf) {
+                        entry.value_numeric = Some(raw_u16 as f64);
+                    }
+                }
+            }
             0x88 | 0x99 => i += 1 + 1,
             0xBB => i += 1 + 4,
 
@@ -841,51 +916,67 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
         }
     }
 
+    let mut sample_idx_builder = UInt32Builder::new();
     let mut param_id_builder = UInt32Builder::new();
+    let mut short_name_builder = StringBuilder::new();
     let mut param_name_builder = StringBuilder::new();
-    let mut unit_builder = StringBuilder::new();
-    let mut value_text_builder = StringBuilder::new();
     let mut value_builder = Float64Builder::new();
+    let mut value_text_builder = StringBuilder::new();
 
-    let mut sorted_params: Vec<_> = params.into_iter().collect();
-    sorted_params.sort_by_key(|(id, _)| *id);
+    let mut dict_by_param_id: HashMap<u32, (String, String)> = HashMap::new();
+    for (_, d) in dict_by_elem {
+        if let Some(pid) = d.param_id {
+            dict_by_param_id.insert(pid, (d.short_name, d.param_name));
+        }
+    }
 
-    for (param_id, param_data) in sorted_params {
-        if !param_data.name.is_empty() {
-            param_id_builder.append_value(param_id);
-            param_name_builder.append_value(&param_data.name);
-            unit_builder.append_value(&param_data.unit);
+    let mut sorted_rows: Vec<_> = sample_params.into_iter().collect();
+    sorted_rows.sort_by_key(|((sample_idx, plist_idx), _)| (*sample_idx, *plist_idx));
 
-            if let Some(text) = &param_data.value_text {
-                value_text_builder.append_value(text);
-            } else {
-                value_text_builder.append_null();
-            }
+    for ((sample_idx, _plist_idx), entry) in sorted_rows {
+        if let Some(pid) = entry.param_id {
+            let (short_name, param_name) = dict_by_param_id
+                .get(&pid)
+                .cloned()
+                .unwrap_or((String::new(), String::new()));
 
-            if let Some(val) = param_data.value_numeric {
+            sample_idx_builder.append_value(sample_idx);
+            param_id_builder.append_value(pid);
+            short_name_builder.append_value(short_name);
+            param_name_builder.append_value(param_name);
+
+            if let Some(val) = entry.value_numeric {
                 value_builder.append_value(val);
             } else {
                 value_builder.append_null();
+            }
+
+            if let Some(text) = &entry.value_text {
+                value_text_builder.append_value(text);
+            } else {
+                value_text_builder.append_null();
             }
         }
     }
 
     let schema = std::sync::Arc::new(Schema::new(vec![
+        Field::new("sample_idx", DataType::UInt32, false),
         Field::new("param_id", DataType::UInt32, false),
+        Field::new("short_name", DataType::Utf8, false),
         Field::new("param_name", DataType::Utf8, false),
-        Field::new("unit", DataType::Utf8, true),
-        Field::new("value_text", DataType::Utf8, true),
         Field::new("value", DataType::Float64, true),
+        Field::new("value_text", DataType::Utf8, true),
     ]));
 
     let batch = RecordBatch::try_new(
         std::sync::Arc::clone(&schema),
         vec![
+            std::sync::Arc::new(sample_idx_builder.finish()),
             std::sync::Arc::new(param_id_builder.finish()),
+            std::sync::Arc::new(short_name_builder.finish()),
             std::sync::Arc::new(param_name_builder.finish()),
-            std::sync::Arc::new(unit_builder.finish()),
-            std::sync::Arc::new(value_text_builder.finish()),
             std::sync::Arc::new(value_builder.finish()),
+            std::sync::Arc::new(value_text_builder.finish()),
         ],
     )
     .map_err(Zs2Error::from)?;
@@ -956,6 +1047,117 @@ fn extract_elem_index(path: &str) -> Option<u32> {
     None
 }
 
+fn extract_direct_sample_parameter_key(path: &str) -> Option<(u32, u32)> {
+    let marker = "/SeriesElements/Elem";
+    let start = path.find(marker)?;
+    let rest = &path[start + marker.len()..];
+
+    let sample_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if sample_digits.is_empty() {
+        return None;
+    }
+    let sample_idx = sample_digits.parse::<u32>().ok()?;
+
+    let after_sample = &rest[sample_digits.len()..];
+    let direct_tail = "/EvalContext/ParamContext/ParameterListe/Elem";
+    if !after_sample.starts_with(direct_tail) {
+        return None;
+    }
+
+    let param_rest = &after_sample[direct_tail.len()..];
+    let plist_digits: String = param_rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if plist_digits.is_empty() {
+        return None;
+    }
+    let plist_idx = plist_digits.parse::<u32>().ok()?;
+
+    Some((sample_idx, plist_idx))
+}
+
+fn decode_qs_valpar_f64(blob: &[u8]) -> Option<f64> {
+    if blob.len() >= 9 {
+        let v = f64::from_le_bytes([
+            blob[1], blob[2], blob[3], blob[4], blob[5], blob[6], blob[7], blob[8],
+        ]);
+        if v.is_finite() && v.abs() < 1.0e12 {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn is_plausible_text_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || " äöüÄÖÜß_./:-+()[]{}%#".contains(c)
+}
+
+fn decode_qs_textpar(blob: &[u8]) -> Option<String> {
+    if blob.len() < 4 {
+        return None;
+    }
+
+    let mut best: Option<(i32, String)> = None;
+
+    for start in 0..(blob.len() - 1) {
+        let mut chars: Vec<char> = Vec::new();
+
+        for j in ((start)..(blob.len() - 1)).step_by(2) {
+            let u = u16::from_le_bytes([blob[j], blob[j + 1]]);
+            if u == 0 {
+                break;
+            }
+            if let Some(c) = char::from_u32(u as u32) {
+                if !is_plausible_text_char(c) {
+                    break;
+                }
+                chars.push(c);
+                if chars.len() >= 64 {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if chars.is_empty() {
+            continue;
+        }
+
+        let candidate: String = chars.iter().collect::<String>().trim().to_string();
+        if candidate.len() < 2 {
+            continue;
+        }
+
+        let has_alpha = candidate.chars().any(|c| c.is_alphabetic() || "äöüÄÖÜß".contains(c));
+        if !has_alpha {
+            continue;
+        }
+
+        let mut score: i32 = 0;
+        if candidate.len() <= 10 {
+            score += 8;
+        }
+        if candidate.chars().all(|c| c.is_ascii_alphabetic()) {
+            score += 15;
+        }
+        if candidate.contains(':') {
+            score -= 8;
+        }
+        if candidate.to_lowercase().contains("1252:") {
+            score -= 20;
+        }
+        score -= candidate.len() as i32 / 2;
+
+        match &best {
+            None => best = Some((score, candidate)),
+            Some((best_score, _)) if score > *best_score => best = Some((score, candidate)),
+            _ => {}
+        }
+    }
+
+    best.map(|(_, s)| s)
+}
+
 fn decode_utf16le(bytes: &[u8]) -> Res<String> {
     if bytes.len() % 2 != 0 {
         return Ok(String::new());
@@ -970,10 +1172,95 @@ fn decode_utf16le(bytes: &[u8]) -> Res<String> {
     Ok(result.trim_end_matches('\0').to_string())
 }
 
-/// Extract shear test results from sample-specific result areas to Parquet
-/// Looks for results in SeriesElements/Elem{N}/EvalContext structures
+fn extract_sample_and_parameter_index(path: &str) -> Option<(u32, u32)> {
+    let sample_idx = if let Some((_, rest)) = path.split_once("/SeriesElements/Elem") {
+        let sample_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if sample_digits.is_empty() {
+            return None;
+        }
+        sample_digits.parse::<u32>().ok()?
+    } else {
+        return None;
+    };
+
+    let param_idx = if let Some((_, rest)) = path.split_once("/EvalContext/ParamContext/ParameterListe/Elem") {
+        let param_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if param_digits.is_empty() {
+            return None;
+        }
+        param_digits.parse::<u32>().ok()?
+    } else {
+        return None;
+    };
+
+    Some((sample_idx, param_idx))
+}
+
+fn decode_first_utf16_segment_from_blob(blob: &[u8]) -> Option<String> {
+    if blob.len() < 4 {
+        return None;
+    }
+
+    for start in (0..blob.len() - 1).step_by(2) {
+        let mut units: Vec<u16> = Vec::new();
+        for j in (start..blob.len() - 1).step_by(2) {
+            let u = u16::from_le_bytes([blob[j], blob[j + 1]]);
+            if u == 0 {
+                break;
+            }
+            units.push(u);
+            if units.len() >= 128 {
+                break;
+            }
+        }
+
+        if units.len() < 2 {
+            continue;
+        }
+
+        if let Ok(decoded) = String::from_utf16(&units) {
+            let trimmed = decoded.trim();
+            if trimmed.len() >= 2
+                && trimmed
+                    .chars()
+                    .any(|c| c.is_alphabetic() || "äöüÄÖÜß".contains(c))
+            {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+fn decode_numeric_from_qs_valpar(blob: &[u8]) -> Option<f64> {
+    if blob.len() >= 8 {
+        let v = f64::from_le_bytes([
+            blob[0], blob[1], blob[2], blob[3], blob[4], blob[5], blob[6], blob[7],
+        ]);
+        if v.is_finite() && v.abs() < 1.0e15 && (v == 0.0 || v.abs() > 1.0e-100) {
+            return Some(v);
+        }
+    }
+
+    None
+}
+
+fn is_likely_value_leaf(leaf: &str) -> bool {
+    let l = leaf.to_lowercase();
+    if ["id", "idx", "index", "count", "anzahl", "typ", "type", "nr", "nummer"]
+        .iter()
+        .any(|bad| l == *bad)
+    {
+        return false;
+    }
+    l.contains("wert") || l.contains("val") || l.contains("value") || l.contains("result")
+}
+
+/// Extract per-sample evaluated test results from:
+/// Document/Body/batch/Series/SeriesElements/Elem{sample}/.../EvalContext/ParamContext/ParameterListe/Elem{param}
 #[pyfunction]
-fn zs2_shear_test_results_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()> {
+fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()> {
     let f = File::open(input_zs2)?;
     let mut gz = GzDecoder::new(BufReader::new(f));
     let mut data = Vec::<u8>::new();
@@ -991,14 +1278,12 @@ fn zs2_shear_test_results_to_parquet(input_zs2: &str, output_parquet: &str) -> P
         value_numeric: Option<f64>,
     }
 
-    // Store results per sample (identified by SeriesElements/Elem{N})
-    // and per result (identified by element index in that context)
-    let mut results_by_sample: HashMap<u32, HashMap<u32, ResultData>> = HashMap::new();
+    let mut results_by_key: HashMap<(u32, u32), ResultData> = HashMap::new();
+    let mut global_param_defs: HashMap<u32, (String, String)> = HashMap::new();
 
     let mut i = 4usize;
     let n = data.len();
     let mut name_stack: Vec<String> = Vec::with_capacity(8);
-    let mut current_sample_id: Option<u32> = None;
 
     while i < n {
         if data[i] == 0xFF {
@@ -1022,18 +1307,8 @@ fn zs2_shear_test_results_to_parquet(input_zs2: &str, output_parquet: &str) -> P
 
         let dtype = data[i];
         let path = name_stack.join("/") + "/" + &name;
-
-        // Track which sample we're in
-        if path.contains("/SeriesElements/Elem") && !path.contains("/EvalContext") {
-            if let Some(elem_idx) = extract_sample_index(&path) {
-                current_sample_id = Some(elem_idx);
-            }
-        }
-
-        // Extract results from paths like: SeriesElements/Elem{N}/EvalContext/ParamContext/ParameterListe/Elem{M}/...
-        // or simply look for EigenschaftenListe in any context under a sample
-        let has_eval_context = path.contains("/EvalContext/");
-        let has_eigenschaft = path.contains("/EigenschaftenListe/");
+        let key = extract_sample_and_parameter_index(&path);
+        let leaf = path.rsplit('/').next().unwrap_or("");
 
         match dtype {
             0xAA | 0x00 => {
@@ -1047,27 +1322,36 @@ fn zs2_shear_test_results_to_parquet(input_zs2: &str, output_parquet: &str) -> P
                 let text = decode_utf16le(&data[i..i + need])?;
                 i += need;
 
-                // Extract results if we have a valid sample context
-                if let Some(sample_id) = current_sample_id {
-                    if let Some(elem_idx) = extract_elem_index(&path) {
-                        let sample_results = results_by_sample.entry(sample_id).or_default();
-                        let entry = sample_results.entry(elem_idx).or_default();
-
-                        // Extract names
-                        if has_eigenschaft && path.ends_with("/Name/Text") {
-                            entry.name = text;
-                        } else if has_eigenschaft && path.ends_with("/EinheitName") {
-                            entry.unit = text;
-                        } else if has_eval_context && path.ends_with("/Name/Text") && !path.ends_with("/Elem/Name/Text") {
-                            // This is likely a result value
-                            let trimmed = text.trim();
-                            if !trimmed.is_empty() && !trimmed.starts_with("Resultat") && !trimmed.starts_with("Automatische") {
-                                let normalized = trimmed.replace(',', ".");
-                                if let Ok(v) = normalized.parse::<f64>() {
-                                    entry.value_numeric = Some(v);
-                                }
-                                entry.value_text = Some(trimmed.to_string());
+                if let Some(k) = key {
+                    let entry = results_by_key.entry(k).or_default();
+                    let trimmed = text.trim();
+                    if path.ends_with("/Name/Text") {
+                        if entry.name.is_empty() {
+                            entry.name = trimmed.to_string();
+                        }
+                    } else if path.ends_with("/EinheitName") {
+                        if entry.unit.is_empty() {
+                            entry.unit = trimmed.to_string();
+                        }
+                    } else if is_likely_value_leaf(leaf) && !trimmed.is_empty() {
+                        if entry.value_text.is_none() {
+                            entry.value_text = Some(trimmed.to_string());
+                        }
+                        let normalized = trimmed.replace(',', ".");
+                        if entry.value_numeric.is_none() {
+                            if let Ok(v) = normalized.parse::<f64>() {
+                                entry.value_numeric = Some(v);
                             }
+                        }
+                    }
+                } else if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/") {
+                    if let Some(param_idx) = extract_elem_index(&path) {
+                        let def = global_param_defs.entry(param_idx).or_insert((String::new(), String::new()));
+                        let trimmed = text.trim();
+                        if path.ends_with("/Name/Text") && !trimmed.is_empty() {
+                            def.0 = trimmed.to_string();
+                        } else if path.ends_with("/EinheitName") && !trimmed.is_empty() {
+                            def.1 = trimmed.to_string();
                         }
                     }
                 }
@@ -1079,12 +1363,9 @@ fn zs2_shear_test_results_to_parquet(input_zs2: &str, output_parquet: &str) -> P
                 let val = i32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as f64;
                 i += 4;
 
-                if let Some(sample_id) = current_sample_id {
-                    if has_eigenschaft {
-                        if let Some(elem_idx) = extract_elem_index(&path) {
-                            let sample_results = results_by_sample.entry(sample_id).or_default();
-                            sample_results.entry(elem_idx).or_default().value_numeric = Some(val);
-                        }
+                if let Some(k) = key {
+                    if is_likely_value_leaf(leaf) {
+                        results_by_key.entry(k).or_default().value_numeric = Some(val);
                     }
                 }
             }
@@ -1095,12 +1376,9 @@ fn zs2_shear_test_results_to_parquet(input_zs2: &str, output_parquet: &str) -> P
                 let val = f32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as f64;
                 i += 4;
 
-                if let Some(sample_id) = current_sample_id {
-                    if has_eigenschaft {
-                        if let Some(elem_idx) = extract_elem_index(&path) {
-                            let sample_results = results_by_sample.entry(sample_id).or_default();
-                            sample_results.entry(elem_idx).or_default().value_numeric = Some(val);
-                        }
+                if let Some(k) = key {
+                    if is_likely_value_leaf(leaf) {
+                        results_by_key.entry(k).or_default().value_numeric = Some(val);
                     }
                 }
             }
@@ -1114,12 +1392,9 @@ fn zs2_shear_test_results_to_parquet(input_zs2: &str, output_parquet: &str) -> P
                 ]);
                 i += 8;
 
-                if let Some(sample_id) = current_sample_id {
-                    if has_eigenschaft {
-                        if let Some(elem_idx) = extract_elem_index(&path) {
-                            let sample_results = results_by_sample.entry(sample_id).or_default();
-                            sample_results.entry(elem_idx).or_default().value_numeric = Some(val);
-                        }
+                if let Some(k) = key {
+                    if is_likely_value_leaf(leaf) {
+                        results_by_key.entry(k).or_default().value_numeric = Some(val);
                     }
                 }
             }
@@ -1140,7 +1415,7 @@ fn zs2_shear_test_results_to_parquet(input_zs2: &str, output_parquet: &str) -> P
                 let cnt = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                 i += 4;
 
-                let bytes_per_item = match sub {
+                let bytes_per_item: usize = match sub {
                     0x0004 | 0x0016 => 4,
                     0x0005 => 8,
                     0x0011 => 1,
@@ -1148,6 +1423,31 @@ fn zs2_shear_test_results_to_parquet(input_zs2: &str, output_parquet: &str) -> P
                 };
                 let need = (cnt as usize) * bytes_per_item;
                 ensure_len(i + need, n, i)?;
+
+                if let Some(k) = key {
+                    if sub == 0x0011 {
+                        let blob = &data[i..i + need];
+                        let entry = results_by_key.entry(k).or_default();
+
+                        if leaf == "QS_TextPar" || leaf.contains("TextPar") {
+                            if let Some(decoded) = decode_first_utf16_segment_from_blob(blob) {
+                                if entry.value_text.is_none() {
+                                    entry.value_text = Some(decoded);
+                                }
+                            }
+                        } else if leaf == "QS_ValPar" || leaf.contains("ValPar") {
+                            if entry.value_numeric.is_none() {
+                                entry.value_numeric = decode_numeric_from_qs_valpar(blob);
+                            }
+                            if entry.value_text.is_none() {
+                                if let Some(decoded) = decode_first_utf16_segment_from_blob(blob) {
+                                    entry.value_text = Some(decoded);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 i += need;
             }
 
@@ -1173,33 +1473,43 @@ fn zs2_shear_test_results_to_parquet(input_zs2: &str, output_parquet: &str) -> P
     let mut value_text_builder = StringBuilder::new();
     let mut value_builder = Float64Builder::new();
 
-    // Iterate through all samples and their results
-    let mut sorted_samples: Vec<_> = results_by_sample.into_iter().collect();
-    sorted_samples.sort_by_key(|(id, _)| *id);
+    let mut sorted_results: Vec<_> = results_by_key.into_iter().collect();
+    sorted_results.sort_by_key(|((sample_id, result_id), _)| (*sample_id, *result_id));
 
-    for (sample_id, results) in sorted_samples {
-        let mut sorted_results: Vec<_> = results.into_iter().collect();
-        sorted_results.sort_by_key(|(id, _)| *id);
+    for ((sample_id, result_id), result_data) in sorted_results {
+        let (def_name, def_unit) = global_param_defs
+            .get(&result_id)
+            .cloned()
+            .unwrap_or((String::new(), String::new()));
 
-        for (result_id, result_data) in sorted_results {
-            if !result_data.name.is_empty() &&
-               (result_data.value_numeric.is_some() || result_data.value_text.is_some()) {
-                sample_id_builder.append_value(sample_id);
-                result_id_builder.append_value(result_id);
-                result_name_builder.append_value(&result_data.name);
-                unit_builder.append_value(&result_data.unit);
+        let final_name = if result_data.name.is_empty() {
+            def_name
+        } else {
+            result_data.name.clone()
+        };
+        let final_unit = if result_data.unit.is_empty() {
+            def_unit
+        } else {
+            result_data.unit.clone()
+        };
 
-                if let Some(text) = &result_data.value_text {
-                    value_text_builder.append_value(text);
-                } else {
-                    value_text_builder.append_null();
-                }
+        if !final_name.is_empty() &&
+           (result_data.value_numeric.is_some() || result_data.value_text.is_some()) {
+            sample_id_builder.append_value(sample_id);
+            result_id_builder.append_value(result_id);
+            result_name_builder.append_value(&final_name);
+            unit_builder.append_value(&final_unit);
 
-                if let Some(val) = result_data.value_numeric {
-                    value_builder.append_value(val);
-                } else {
-                    value_builder.append_null();
-                }
+            if let Some(text) = &result_data.value_text {
+                value_text_builder.append_value(text);
+            } else {
+                value_text_builder.append_null();
+            }
+
+            if let Some(val) = result_data.value_numeric {
+                value_builder.append_value(val);
+            } else {
+                value_builder.append_null();
             }
         }
     }
@@ -1236,6 +1546,12 @@ fn zs2_shear_test_results_to_parquet(input_zs2: &str, output_parquet: &str) -> P
     Ok(())
 }
 
+/// Backward-compatible alias for existing notebooks/scripts.
+#[pyfunction]
+fn zs2_shear_test_results_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()> {
+    zs2_parameterliste_results_to_parquet(input_zs2, output_parquet)
+}
+
 fn infer_unit_from_channel_name(channel_name: &str) -> &'static str {
     let lower = channel_name.to_lowercase();
 
@@ -1257,6 +1573,7 @@ fn zs2fast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(zs2_to_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(zs2_channels_to_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(zs2_evaluated_params_to_parquet, m)?)?;
+    m.add_function(wrap_pyfunction!(zs2_parameterliste_results_to_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(zs2_shear_test_results_to_parquet, m)?)?;
     Ok(())
 }
