@@ -970,6 +970,272 @@ fn decode_utf16le(bytes: &[u8]) -> Res<String> {
     Ok(result.trim_end_matches('\0').to_string())
 }
 
+/// Extract shear test results from sample-specific result areas to Parquet
+/// Looks for results in SeriesElements/Elem{N}/EvalContext structures
+#[pyfunction]
+fn zs2_shear_test_results_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()> {
+    let f = File::open(input_zs2)?;
+    let mut gz = GzDecoder::new(BufReader::new(f));
+    let mut data = Vec::<u8>::new();
+    gz.read_to_end(&mut data)?;
+
+    if data.len() < 4 || data[0..4] != [0xAF, 0xBE, 0xAD, 0xDE] {
+        return Err(Zs2Error::BadMarker.into());
+    }
+
+    #[derive(Default, Clone)]
+    struct ResultData {
+        name: String,
+        unit: String,
+        value_text: Option<String>,
+        value_numeric: Option<f64>,
+    }
+
+    // Store results per sample (identified by SeriesElements/Elem{N})
+    // and per result (identified by element index in that context)
+    let mut results_by_sample: HashMap<u32, HashMap<u32, ResultData>> = HashMap::new();
+
+    let mut i = 4usize;
+    let n = data.len();
+    let mut name_stack: Vec<String> = Vec::with_capacity(8);
+    let mut current_sample_id: Option<u32> = None;
+
+    while i < n {
+        if data[i] == 0xFF {
+            if !name_stack.is_empty() {
+                name_stack.pop();
+            }
+            i += 1;
+            continue;
+        }
+
+        ensure_len(i + 1, n, i)?;
+        let name_len = data[i] as usize;
+        i += 1;
+        ensure_len(i + name_len, n, i)?;
+        let name = str::from_utf8(&data[i..i + name_len])?.to_string();
+        i += name_len;
+
+        if i >= n {
+            break;
+        }
+
+        let dtype = data[i];
+        let path = name_stack.join("/") + "/" + &name;
+
+        // Track which sample we're in
+        if path.contains("/SeriesElements/Elem") && !path.contains("/EvalContext") {
+            if let Some(elem_idx) = extract_sample_index(&path) {
+                current_sample_id = Some(elem_idx);
+            }
+        }
+
+        // Extract results from paths like: SeriesElements/Elem{N}/EvalContext/ParamContext/ParameterListe/Elem{M}/...
+        // or simply look for EigenschaftenListe in any context under a sample
+        let has_eval_context = path.contains("/EvalContext/");
+        let has_eigenschaft = path.contains("/EigenschaftenListe/");
+
+        match dtype {
+            0xAA | 0x00 => {
+                ensure_len(i + 1 + 4, n, i)?;
+                i += 1;
+                let raw = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                i += 4;
+                let char_count = (raw & 0x7FFF_FFFF) as usize;
+                let need = char_count * 2;
+                ensure_len(i + need, n, i)?;
+                let text = decode_utf16le(&data[i..i + need])?;
+                i += need;
+
+                // Extract results if we have a valid sample context
+                if let Some(sample_id) = current_sample_id {
+                    if let Some(elem_idx) = extract_elem_index(&path) {
+                        let sample_results = results_by_sample.entry(sample_id).or_default();
+                        let entry = sample_results.entry(elem_idx).or_default();
+
+                        // Extract names
+                        if has_eigenschaft && path.ends_with("/Name/Text") {
+                            entry.name = text;
+                        } else if has_eigenschaft && path.ends_with("/EinheitName") {
+                            entry.unit = text;
+                        } else if has_eval_context && path.ends_with("/Name/Text") && !path.ends_with("/Elem/Name/Text") {
+                            // This is likely a result value
+                            let trimmed = text.trim();
+                            if !trimmed.is_empty() && !trimmed.starts_with("Resultat") && !trimmed.starts_with("Automatische") {
+                                let normalized = trimmed.replace(',', ".");
+                                if let Ok(v) = normalized.parse::<f64>() {
+                                    entry.value_numeric = Some(v);
+                                }
+                                entry.value_text = Some(trimmed.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
+            0x22 => {
+                ensure_len(i + 1 + 4, n, i)?;
+                i += 1;
+                let val = i32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as f64;
+                i += 4;
+
+                if let Some(sample_id) = current_sample_id {
+                    if has_eigenschaft {
+                        if let Some(elem_idx) = extract_elem_index(&path) {
+                            let sample_results = results_by_sample.entry(sample_id).or_default();
+                            sample_results.entry(elem_idx).or_default().value_numeric = Some(val);
+                        }
+                    }
+                }
+            }
+
+            0x44 => {
+                ensure_len(i + 1 + 4, n, i)?;
+                i += 1;
+                let val = f32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as f64;
+                i += 4;
+
+                if let Some(sample_id) = current_sample_id {
+                    if has_eigenschaft {
+                        if let Some(elem_idx) = extract_elem_index(&path) {
+                            let sample_results = results_by_sample.entry(sample_id).or_default();
+                            sample_results.entry(elem_idx).or_default().value_numeric = Some(val);
+                        }
+                    }
+                }
+            }
+
+            0xCC => {
+                ensure_len(i + 1 + 8, n, i)?;
+                i += 1;
+                let val = f64::from_le_bytes([
+                    data[i], data[i + 1], data[i + 2], data[i + 3],
+                    data[i + 4], data[i + 5], data[i + 6], data[i + 7],
+                ]);
+                i += 8;
+
+                if let Some(sample_id) = current_sample_id {
+                    if has_eigenschaft {
+                        if let Some(elem_idx) = extract_elem_index(&path) {
+                            let sample_results = results_by_sample.entry(sample_id).or_default();
+                            sample_results.entry(elem_idx).or_default().value_numeric = Some(val);
+                        }
+                    }
+                }
+            }
+
+            0xDD => {
+                ensure_len(i + 2, n, i)?;
+                let len = data[i + 1] as usize;
+                ensure_len(i + 2 + len, n, i)?;
+                i += 2 + len;
+                name_stack.push(name);
+            }
+
+            0xEE => {
+                ensure_len(i + 1 + 2 + 4, n, i)?;
+                i += 1;
+                let sub = u16::from_le_bytes([data[i], data[i + 1]]);
+                i += 2;
+                let cnt = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                i += 4;
+
+                let bytes_per_item = match sub {
+                    0x0004 | 0x0016 => 4,
+                    0x0005 => 8,
+                    0x0011 => 1,
+                    _ => 0,
+                };
+                let need = (cnt as usize) * bytes_per_item;
+                ensure_len(i + need, n, i)?;
+                i += need;
+            }
+
+            0x11 | 0x33 => i += 1 + 4,
+            0x55 | 0x66 => i += 1 + 2,
+            0x88 | 0x99 => i += 1 + 1,
+            0xBB => i += 1 + 4,
+
+            _ => {
+                return Err(Zs2Error::Parse {
+                    offset: i,
+                    msg: format!("Unknown data type tag 0x{dtype:02X}"),
+                }
+                .into())
+            }
+        }
+    }
+
+    let mut sample_id_builder = UInt32Builder::new();
+    let mut result_id_builder = UInt32Builder::new();
+    let mut result_name_builder = StringBuilder::new();
+    let mut unit_builder = StringBuilder::new();
+    let mut value_text_builder = StringBuilder::new();
+    let mut value_builder = Float64Builder::new();
+
+    // Iterate through all samples and their results
+    let mut sorted_samples: Vec<_> = results_by_sample.into_iter().collect();
+    sorted_samples.sort_by_key(|(id, _)| *id);
+
+    for (sample_id, results) in sorted_samples {
+        let mut sorted_results: Vec<_> = results.into_iter().collect();
+        sorted_results.sort_by_key(|(id, _)| *id);
+
+        for (result_id, result_data) in sorted_results {
+            if !result_data.name.is_empty() &&
+               (result_data.value_numeric.is_some() || result_data.value_text.is_some()) {
+                sample_id_builder.append_value(sample_id);
+                result_id_builder.append_value(result_id);
+                result_name_builder.append_value(&result_data.name);
+                unit_builder.append_value(&result_data.unit);
+
+                if let Some(text) = &result_data.value_text {
+                    value_text_builder.append_value(text);
+                } else {
+                    value_text_builder.append_null();
+                }
+
+                if let Some(val) = result_data.value_numeric {
+                    value_builder.append_value(val);
+                } else {
+                    value_builder.append_null();
+                }
+            }
+        }
+    }
+
+    let schema = std::sync::Arc::new(Schema::new(vec![
+        Field::new("sample_id", DataType::UInt32, false),
+        Field::new("result_id", DataType::UInt32, false),
+        Field::new("result_name", DataType::Utf8, false),
+        Field::new("unit", DataType::Utf8, true),
+        Field::new("value_text", DataType::Utf8, true),
+        Field::new("value", DataType::Float64, true),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::clone(&schema),
+        vec![
+            std::sync::Arc::new(sample_id_builder.finish()),
+            std::sync::Arc::new(result_id_builder.finish()),
+            std::sync::Arc::new(result_name_builder.finish()),
+            std::sync::Arc::new(unit_builder.finish()),
+            std::sync::Arc::new(value_text_builder.finish()),
+            std::sync::Arc::new(value_builder.finish()),
+        ],
+    )
+    .map_err(Zs2Error::from)?;
+
+    let file = File::create(output_parquet)?;
+    let props = WriterProperties::builder().build();
+    let mut writer = ArrowWriter::try_new(file, std::sync::Arc::clone(&schema), Some(props))
+        .map_err(Zs2Error::from)?;
+    writer.write(&batch).map_err(Zs2Error::from)?;
+    writer.close().map_err(Zs2Error::from)?;
+
+    Ok(())
+}
+
 fn infer_unit_from_channel_name(channel_name: &str) -> &'static str {
     let lower = channel_name.to_lowercase();
 
@@ -991,5 +1257,6 @@ fn zs2fast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(zs2_to_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(zs2_channels_to_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(zs2_evaluated_params_to_parquet, m)?)?;
+    m.add_function(wrap_pyfunction!(zs2_shear_test_results_to_parquet, m)?)?;
     Ok(())
 }
