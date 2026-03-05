@@ -1050,8 +1050,8 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
         let leaf = path.rsplit('/').next().unwrap_or("");
         let sample_key = extract_direct_sample_parameter_key(&path);
         let in_global_dict = path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/");
-        let in_channel_manager =
-            path.contains("/SeriesDef/TestTaskDefs/") && path.contains("/ChannelManager/ChannelManager/Elem");
+        let in_channel_manager = path.contains("/SeriesDef/TestTaskDefs/")
+            && path.contains("/ChannelManager/ChannelManager/Elem");
         let in_unit_tables = path.starts_with("/UnitTables/") || path.contains("/UnitTables/");
         let dict_elem_idx = if in_global_dict {
             extract_elem_index(&path)
@@ -1115,13 +1115,20 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
                         }
                         // UnitTables/Elem{N}/Units/Elem{M}/DisplayName/Text
                         if path.ends_with("/DisplayName/Text") {
-                            if let Some((tbl_idx, unit_idx)) = extract_unit_table_unit_indices(&path) {
-                                ut_units.entry((tbl_idx, unit_idx)).or_default().display_name = trimmed.clone();
+                            if let Some((tbl_idx, unit_idx)) =
+                                extract_unit_table_unit_indices(&path)
+                            {
+                                ut_units
+                                    .entry((tbl_idx, unit_idx))
+                                    .or_default()
+                                    .display_name = trimmed.clone();
                             }
                         }
                         // UnitTables/Elem{N}/Units/Elem{M}/Name (fallback if no DisplayName)
                         if path.ends_with("/Name") && path.contains("/Units/Elem") {
-                            if let Some((tbl_idx, unit_idx)) = extract_unit_table_unit_indices(&path) {
+                            if let Some((tbl_idx, unit_idx)) =
+                                extract_unit_table_unit_indices(&path)
+                            {
                                 let entry = ut_units.entry((tbl_idx, unit_idx)).or_default();
                                 if entry.display_name.is_empty() {
                                     entry.display_name = trimmed;
@@ -1337,7 +1344,8 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
 
                 if in_channel_manager && path.ends_with("/ID") {
                     if let Some(elem_idx) = cm_elem_idx {
-                        cm_units_by_elem.entry(elem_idx).or_default().param_id = Some(raw_u16 as u32);
+                        cm_units_by_elem.entry(elem_idx).or_default().param_id =
+                            Some(raw_u16 as u32);
                     }
                 }
 
@@ -1380,7 +1388,8 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
         let mut base_unit: Option<String> = None;
         // Find the unit entry with Factor == 1.0 (base unit)
         for ((ti, _ui), unit_info) in &ut_units {
-            if ti == tbl_idx && unit_info.factor == Some(1.0) && !unit_info.display_name.is_empty() {
+            if ti == tbl_idx && unit_info.factor == Some(1.0) && !unit_info.display_name.is_empty()
+            {
                 base_unit = Some(unit_info.display_name.clone());
                 break;
             }
@@ -1405,7 +1414,9 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
             if unit.trim().is_empty() && !d.unit_table_key.trim().is_empty() {
                 if let Some(symbol) = ut_key_to_symbol.get(d.unit_table_key.trim()) {
                     unit = symbol.clone();
-                } else if let Some(mapped) = infer_unit_from_unit_table_name(d.unit_table_key.trim()) {
+                } else if let Some(mapped) =
+                    infer_unit_from_unit_table_name(d.unit_table_key.trim())
+                {
                     unit = mapped.to_string();
                 }
             }
