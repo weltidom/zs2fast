@@ -1,9 +1,9 @@
 use flate2::read::GzDecoder;
 use pyo3::prelude::*;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::str;
-use std::collections::HashMap;
 use thiserror::Error;
 
 use arrow::array::{ArrayRef, Float64Builder, StringBuilder, UInt32Builder};
@@ -132,7 +132,9 @@ fn zs2_to_parquet(
                 if cnt > MAX_ARRAY_ELEMENTS {
                     return Err(Zs2Error::Parse {
                         offset: i,
-                        msg: format!("array element count {cnt} exceeds limit {MAX_ARRAY_ELEMENTS}"),
+                        msg: format!(
+                            "array element count {cnt} exceeds limit {MAX_ARRAY_ELEMENTS}"
+                        ),
                     }
                     .into());
                 }
@@ -353,7 +355,7 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
         param_name: String,
         unit_name: String,
     }
-    
+
     let mut eig_dict_by_elem: HashMap<u32, ParamDictEntry> = HashMap::new();
     let mut cm_dict_by_elem: HashMap<u32, ParamDictEntry> = HashMap::new();
     let mut channel_trs_ids: HashMap<String, u32> = HashMap::new(); // "sample_{s}/ch_{idx}" -> TrsChannelId
@@ -416,7 +418,8 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                 if is_eigenschaftenliste && path.ends_with("/ID") && sub == 0x0016 && cnt >= 1 {
                     let need = cnt as usize * 4;
                     ensure_len(i + need, n, i)?;
-                    let param_id = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                    let param_id =
+                        u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                     if let Some(elem_idx) = elem_idx_opt {
                         eig_dict_by_elem.entry(elem_idx).or_default().param_id = Some(param_id);
                     }
@@ -427,7 +430,8 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                 if is_channel_manager && path.ends_with("/ID") && sub == 0x0016 && cnt >= 1 {
                     let need = cnt as usize * 4;
                     ensure_len(i + need, n, i)?;
-                    let param_id = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                    let param_id =
+                        u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                     if let Some(elem_idx) = elem_idx_opt {
                         cm_dict_by_elem.entry(elem_idx).or_default().param_id = Some(param_id);
                     }
@@ -437,7 +441,13 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
 
                 // Skip array data
                 let bytes_per_item = match sub {
-                    0x0004 | 0x0016 | 0x0005 => if sub == 0x0005 { 8 } else { 4 },
+                    0x0004 | 0x0016 | 0x0005 => {
+                        if sub == 0x0005 {
+                            8
+                        } else {
+                            4
+                        }
+                    }
                     0x0011 => 1usize,
                     _ => 0usize,
                 };
@@ -548,7 +558,8 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                 if path.contains("/DataChannels/") && path.contains("/TrsChannelId") {
                     ensure_len(i + 1 + 4, n, i)?;
                     i += 1;
-                    let trs_id = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                    let trs_id =
+                        u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                     i += 4;
 
                     if let Some(sample_idx) = extract_sample_index(&path) {
@@ -570,7 +581,7 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                 i += 1;
                 let raw_u32 = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                 i += 4;
-                
+
                 if is_eigenschaftenliste && path.ends_with("/ID") {
                     if let Some(elem_idx) = elem_idx_opt {
                         eig_dict_by_elem.entry(elem_idx).or_default().param_id = Some(raw_u32);
@@ -589,16 +600,18 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                 i += 1;
                 let raw_u16 = u16::from_le_bytes([data[i], data[i + 1]]);
                 i += 2;
-                
+
                 if is_eigenschaftenliste && path.ends_with("/ID") {
                     if let Some(elem_idx) = elem_idx_opt {
-                        eig_dict_by_elem.entry(elem_idx).or_default().param_id = Some(raw_u16 as u32);
+                        eig_dict_by_elem.entry(elem_idx).or_default().param_id =
+                            Some(raw_u16 as u32);
                     }
                 }
 
                 if is_channel_manager && path.ends_with("/ID") {
                     if let Some(elem_idx) = elem_idx_opt {
-                        cm_dict_by_elem.entry(elem_idx).or_default().param_id = Some(raw_u16 as u32);
+                        cm_dict_by_elem.entry(elem_idx).or_default().param_id =
+                            Some(raw_u16 as u32);
                     }
                 }
             }
@@ -747,7 +760,9 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
             }
 
             // Check if this is a real-time capture channel
-            if path.contains("/DataChannels/") && path.contains("RealTimeCapture/Trs/SingleGroupDataBlock") {
+            if path.contains("/DataChannels/")
+                && path.contains("RealTimeCapture/Trs/SingleGroupDataBlock")
+            {
                 if let (Some(sample_idx), Some(ch_idx)) = (
                     extract_sample_index(&path),
                     extract_data_channel_index(&path),
@@ -778,10 +793,7 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
 
                     // Look up unit name from TrsChannelId -> unit_names
                     let unit = if let Some(tid) = trs_id {
-                        let explicit = trs_to_unit
-                            .get(&tid)
-                            .cloned()
-                            .unwrap_or_default();
+                        let explicit = trs_to_unit.get(&tid).cloned().unwrap_or_default();
                         if explicit.trim().is_empty() {
                             infer_unit_from_channel_name(&ch_name).to_string()
                         } else {
@@ -796,7 +808,8 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                         let value = match sub {
                             0x0004 => {
                                 if chunk.len() >= 4 {
-                                    f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f64
+                                    f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                                        as f64
                                 } else {
                                     f64::NAN
                                 }
@@ -804,8 +817,8 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                             0x0005 => {
                                 if chunk.len() >= 8 {
                                     f64::from_le_bytes([
-                                        chunk[0], chunk[1], chunk[2], chunk[3],
-                                        chunk[4], chunk[5], chunk[6], chunk[7],
+                                        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5],
+                                        chunk[6], chunk[7],
                                     ])
                                 } else {
                                     f64::NAN
@@ -813,7 +826,8 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                             }
                             0x0016 => {
                                 if chunk.len() >= 4 {
-                                    u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f64
+                                    u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                                        as f64
                                 } else {
                                     f64::NAN
                                 }
@@ -846,7 +860,13 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
 
             // Skip non-channel data
             let bytes_per_item = match sub {
-                0x0004 | 0x0016 | 0x0005 => if sub == 0x0005 { 8 } else { 4 },
+                0x0004 | 0x0016 | 0x0005 => {
+                    if sub == 0x0005 {
+                        8
+                    } else {
+                        4
+                    }
+                }
                 0x0011 => 1,
                 _ => 0,
             };
@@ -989,7 +1009,11 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
         let leaf = path.rsplit('/').next().unwrap_or("");
         let sample_key = extract_direct_sample_parameter_key(&path);
         let in_global_dict = path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/");
-        let dict_elem_idx = if in_global_dict { extract_elem_index(&path) } else { None };
+        let dict_elem_idx = if in_global_dict {
+            extract_elem_index(&path)
+        } else {
+            None
+        };
 
         match dtype {
             0xAA | 0x00 => {
@@ -1026,7 +1050,8 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
                 ensure_len(i + 1 + 4, n, i)?;
                 i += 1;
                 let raw_u32 = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
-                let val = i32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as f64;
+                let val =
+                    i32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as f64;
                 i += 4;
 
                 if in_global_dict && path.ends_with("/ID") {
@@ -1048,7 +1073,8 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
             0x44 => {
                 ensure_len(i + 1 + 4, n, i)?;
                 i += 1;
-                let val = f32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as f64;
+                let val =
+                    f32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as f64;
                 i += 4;
 
                 if let Some((s_idx, p_idx)) = sample_key {
@@ -1065,8 +1091,14 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
                 ensure_len(i + 1 + 8, n, i)?;
                 i += 1;
                 let val = f64::from_le_bytes([
-                    data[i], data[i + 1], data[i + 2], data[i + 3],
-                    data[i + 4], data[i + 5], data[i + 6], data[i + 7],
+                    data[i],
+                    data[i + 1],
+                    data[i + 2],
+                    data[i + 3],
+                    data[i + 4],
+                    data[i + 5],
+                    data[i + 6],
+                    data[i + 7],
                 ]);
                 i += 8;
 
@@ -1123,7 +1155,8 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
                 ensure_len(i + need, n, i)?;
 
                 if sub == 0x0016 && cnt >= 1 && need >= 4 && leaf == "ID" {
-                    let raw_u32 = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                    let raw_u32 =
+                        u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
 
                     if in_global_dict {
                         if let Some(elem_idx) = dict_elem_idx {
@@ -1360,7 +1393,10 @@ fn extract_direct_sample_parameter_key(path: &str) -> Option<(u32, u32)> {
     }
 
     let param_rest = &after_sample[direct_tail.len()..];
-    let plist_digits: String = param_rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let plist_digits: String = param_rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     if plist_digits.is_empty() {
         return None;
     }
@@ -1382,8 +1418,7 @@ fn decode_qs_valpar_f64(blob: &[u8]) -> Option<f64> {
 }
 
 fn is_plausible_text_char(c: char) -> bool {
-    c.is_ascii_alphanumeric()
-        || " äöüÄÖÜß_./:-+()[]{}%#".contains(c)
+    c.is_ascii_alphanumeric() || " äöüÄÖÜß_./:-+()[]{}%#".contains(c)
 }
 
 fn decode_qs_textpar(blob: &[u8]) -> Option<String> {
@@ -1423,7 +1458,9 @@ fn decode_qs_textpar(blob: &[u8]) -> Option<String> {
             continue;
         }
 
-        let has_alpha = candidate.chars().any(|c| c.is_alphabetic() || "äöüÄÖÜß".contains(c));
+        let has_alpha = candidate
+            .chars()
+            .any(|c| c.is_alphabetic() || "äöüÄÖÜß".contains(c));
         if !has_alpha {
             continue;
         }
@@ -1478,15 +1515,16 @@ fn extract_sample_and_parameter_index(path: &str) -> Option<(u32, u32)> {
         return None;
     };
 
-    let param_idx = if let Some((_, rest)) = path.split_once("/EvalContext/ParamContext/ParameterListe/Elem") {
-        let param_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if param_digits.is_empty() {
+    let param_idx =
+        if let Some((_, rest)) = path.split_once("/EvalContext/ParamContext/ParameterListe/Elem") {
+            let param_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if param_digits.is_empty() {
+                return None;
+            }
+            param_digits.parse::<u32>().ok()?
+        } else {
             return None;
-        }
-        param_digits.parse::<u32>().ok()?
-    } else {
-        return None;
-    };
+        };
 
     Some((sample_idx, param_idx))
 }
@@ -1543,9 +1581,11 @@ fn decode_numeric_from_qs_valpar(blob: &[u8]) -> Option<f64> {
 
 fn is_likely_value_leaf(leaf: &str) -> bool {
     let l = leaf.to_lowercase();
-    if ["id", "idx", "index", "count", "anzahl", "typ", "type", "nr", "nummer"]
-        .iter()
-        .any(|bad| l == *bad)
+    if [
+        "id", "idx", "index", "count", "anzahl", "typ", "type", "nr", "nummer",
+    ]
+    .iter()
+    .any(|bad| l == *bad)
     {
         return false;
     }
@@ -1643,7 +1683,9 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
                     }
                 } else if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/") {
                     if let Some(param_idx) = extract_elem_index(&path) {
-                        let def = global_param_defs.entry(param_idx).or_insert((String::new(), String::new()));
+                        let def = global_param_defs
+                            .entry(param_idx)
+                            .or_insert((String::new(), String::new()));
                         let trimmed = text.trim();
                         if path.ends_with("/Name/Text") && !trimmed.is_empty() {
                             def.0 = trimmed.to_string();
@@ -1657,7 +1699,8 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
             0x22 => {
                 ensure_len(i + 1 + 4, n, i)?;
                 i += 1;
-                let val = i32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as f64;
+                let val =
+                    i32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as f64;
                 i += 4;
 
                 if let Some(k) = key {
@@ -1670,7 +1713,8 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
             0x44 => {
                 ensure_len(i + 1 + 4, n, i)?;
                 i += 1;
-                let val = f32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as f64;
+                let val =
+                    f32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as f64;
                 i += 4;
 
                 if let Some(k) = key {
@@ -1684,8 +1728,14 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
                 ensure_len(i + 1 + 8, n, i)?;
                 i += 1;
                 let val = f64::from_le_bytes([
-                    data[i], data[i + 1], data[i + 2], data[i + 3],
-                    data[i + 4], data[i + 5], data[i + 6], data[i + 7],
+                    data[i],
+                    data[i + 1],
+                    data[i + 2],
+                    data[i + 3],
+                    data[i + 4],
+                    data[i + 5],
+                    data[i + 6],
+                    data[i + 7],
                 ]);
                 i += 8;
 
@@ -1807,8 +1857,9 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
             result_data.unit.clone()
         };
 
-        if !final_name.is_empty() &&
-           (result_data.value_numeric.is_some() || result_data.value_text.is_some()) {
+        if !final_name.is_empty()
+            && (result_data.value_numeric.is_some() || result_data.value_text.is_some())
+        {
             sample_id_builder.append_value(sample_id);
             result_id_builder.append_value(result_id);
             result_name_builder.append_value(&final_name);
