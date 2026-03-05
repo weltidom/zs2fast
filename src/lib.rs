@@ -1177,10 +1177,8 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
                             if entry.value_numeric.is_none() {
                                 entry.value_numeric = decode_qs_valpar_f64(blob);
                             }
-                        } else if leaf == "QS_TextPar" {
-                            if entry.value_text.is_none() {
-                                entry.value_text = decode_qs_textpar(blob);
-                            }
+                        } else if leaf == "QS_TextPar" && entry.value_text.is_none() {
+                            entry.value_text = decode_qs_textpar(blob);
                         }
                     }
                 }
@@ -1491,7 +1489,7 @@ fn decode_qs_textpar(blob: &[u8]) -> Option<String> {
 }
 
 fn decode_utf16le(bytes: &[u8]) -> Res<String> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Ok(String::new());
     }
     let mut result = String::new();
