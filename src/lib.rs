@@ -990,6 +990,7 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
         short_name: String,
         param_name: String,
         unit: String,
+        unit_table_key: String,
     }
 
     #[derive(Default)]
@@ -1005,9 +1006,20 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
         unit_name: String,
     }
 
+    /// A single unit entry inside a UnitTable (e.g. "mm" with Factor=1.0)
+    #[derive(Default)]
+    struct UnitTableUnit {
+        display_name: String,
+        factor: Option<f64>,
+    }
+
     let mut dict_by_elem: HashMap<u32, DictEntry> = HashMap::new();
     let mut cm_units_by_elem: HashMap<u32, ChannelUnitEntry> = HashMap::new();
     let mut sample_params: HashMap<(u32, u32), SampleParam> = HashMap::new();
+
+    // UnitTables tracking: ut_keys[table_idx] = key name, ut_units[(table_idx, unit_idx)] = unit info
+    let mut ut_keys: HashMap<u32, String> = HashMap::new();
+    let mut ut_units: HashMap<(u32, u32), UnitTableUnit> = HashMap::new();
 
     let mut i = 4usize;
     let n = data.len();
@@ -1040,6 +1052,7 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
         let in_global_dict = path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/");
         let in_channel_manager =
             path.contains("/SeriesDef/TestTaskDefs/") && path.contains("/ChannelManager/ChannelManager/Elem");
+        let in_unit_tables = path.starts_with("/UnitTables/") || path.contains("/UnitTables/");
         let dict_elem_idx = if in_global_dict {
             extract_elem_index(&path)
         } else {
@@ -1089,6 +1102,32 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
                     if path.ends_with("/UnitTableName") || path.ends_with("/Einheit/Kurzzeichen") {
                         cm_units_by_elem.entry(elem_idx).or_default().unit_name =
                             text.trim().to_string();
+                    }
+                }
+
+                // UnitTables key and unit display name extraction
+                if in_unit_tables {
+                    let trimmed = text.trim().to_string();
+                    if !trimmed.is_empty() {
+                        // UnitTables/Key{N}
+                        if let Some(key_idx) = extract_unit_table_key_index(&path) {
+                            ut_keys.insert(key_idx, trimmed.clone());
+                        }
+                        // UnitTables/Elem{N}/Units/Elem{M}/DisplayName/Text
+                        if path.ends_with("/DisplayName/Text") {
+                            if let Some((tbl_idx, unit_idx)) = extract_unit_table_unit_indices(&path) {
+                                ut_units.entry((tbl_idx, unit_idx)).or_default().display_name = trimmed.clone();
+                            }
+                        }
+                        // UnitTables/Elem{N}/Units/Elem{M}/Name (fallback if no DisplayName)
+                        if path.ends_with("/Name") && path.contains("/Units/Elem") {
+                            if let Some((tbl_idx, unit_idx)) = extract_unit_table_unit_indices(&path) {
+                                let entry = ut_units.entry((tbl_idx, unit_idx)).or_default();
+                                if entry.display_name.is_empty() {
+                                    entry.display_name = trimmed;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1163,6 +1202,13 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
                         entry.value_numeric = Some(val);
                     }
                 }
+
+                // UnitTables Factor extraction
+                if in_unit_tables && path.ends_with("/Factor") {
+                    if let Some((tbl_idx, unit_idx)) = extract_unit_table_unit_indices(&path) {
+                        ut_units.entry((tbl_idx, unit_idx)).or_default().factor = Some(val);
+                    }
+                }
             }
 
             0xDD => {
@@ -1232,6 +1278,16 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
                             }
                         } else if leaf == "QS_TextPar" && entry.value_text.is_none() {
                             entry.value_text = decode_qs_textpar(blob);
+                        }
+                    }
+                }
+
+                // Extract UnitTable key from QS_ValSetting in EigenschaftenListe
+                if in_global_dict && sub == 0x0011 && leaf == "QS_ValSetting" {
+                    let blob = &data[i..i + need];
+                    if let Some(ut_key) = decode_unit_table_key_from_blob(blob) {
+                        if let Some(elem_idx) = dict_elem_idx {
+                            dict_by_elem.entry(elem_idx).or_default().unit_table_key = ut_key;
                         }
                     }
                 }
@@ -1316,9 +1372,44 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
     let mut value_text_builder = StringBuilder::new();
 
     let mut dict_by_param_id: HashMap<u32, (String, String, String)> = HashMap::new();
+
+    // Build UnitTable key -> base unit symbol mapping
+    // For each UnitTable, find the unit entry with Factor == 1.0 and use its DisplayName
+    let mut ut_key_to_symbol: HashMap<String, String> = HashMap::new();
+    for (tbl_idx, key_name) in &ut_keys {
+        let mut base_unit: Option<String> = None;
+        // Find the unit entry with Factor == 1.0 (base unit)
+        for ((ti, _ui), unit_info) in &ut_units {
+            if ti == tbl_idx && unit_info.factor == Some(1.0) && !unit_info.display_name.is_empty() {
+                base_unit = Some(unit_info.display_name.clone());
+                break;
+            }
+        }
+        // Fallback: use first unit (index 0) if no Factor=1.0 found
+        if base_unit.is_none() {
+            if let Some(unit_info) = ut_units.get(&(*tbl_idx, 0)) {
+                if !unit_info.display_name.is_empty() {
+                    base_unit = Some(unit_info.display_name.clone());
+                }
+            }
+        }
+        if let Some(symbol) = base_unit {
+            ut_key_to_symbol.insert(key_name.clone(), symbol);
+        }
+    }
+
     for (_, d) in dict_by_elem {
         if let Some(pid) = d.param_id {
-            dict_by_param_id.insert(pid, (d.short_name, d.param_name, d.unit));
+            let mut unit = d.unit.clone();
+            // If no direct EinheitName, resolve via QS_ValSetting UnitTable key
+            if unit.trim().is_empty() && !d.unit_table_key.trim().is_empty() {
+                if let Some(symbol) = ut_key_to_symbol.get(d.unit_table_key.trim()) {
+                    unit = symbol.clone();
+                } else if let Some(mapped) = infer_unit_from_unit_table_name(d.unit_table_key.trim()) {
+                    unit = mapped.to_string();
+                }
+            }
+            dict_by_param_id.insert(pid, (d.short_name, d.param_name, unit));
         }
     }
 
@@ -1489,6 +1580,104 @@ fn extract_direct_sample_parameter_key(path: &str) -> Option<(u32, u32)> {
     let plist_idx = plist_digits.parse::<u32>().ok()?;
 
     Some((sample_idx, plist_idx))
+}
+
+/// Extract UnitTable key index from path like ".../UnitTables/Key{N}"
+fn extract_unit_table_key_index(path: &str) -> Option<u32> {
+    if let Some(pos) = path.find("/UnitTables/Key") {
+        let rest = &path[pos + "/UnitTables/Key".len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() && rest.len() == digits.len() {
+            return digits.parse::<u32>().ok();
+        }
+    }
+    None
+}
+
+/// Extract (table_idx, unit_idx) from path like ".../UnitTables/Elem{N}/Units/Elem{M}/..."
+fn extract_unit_table_unit_indices(path: &str) -> Option<(u32, u32)> {
+    let marker1 = "/UnitTables/Elem";
+    let pos1 = path.find(marker1)?;
+    let rest1 = &path[pos1 + marker1.len()..];
+    let digits1: String = rest1.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits1.is_empty() {
+        return None;
+    }
+    let tbl_idx = digits1.parse::<u32>().ok()?;
+
+    let marker2 = "/Units/Elem";
+    let rest2 = &rest1[digits1.len()..];
+    let pos2 = rest2.find(marker2)?;
+    let rest3 = &rest2[pos2 + marker2.len()..];
+    let digits2: String = rest3.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits2.is_empty() {
+        return None;
+    }
+    let unit_idx = digits2.parse::<u32>().ok()?;
+
+    Some((tbl_idx, unit_idx))
+}
+
+/// Decode a UnitTable key name (e.g. "UT_Length", "Arbeit/Masse") from a QS_ValSetting blob.
+/// The key is stored as a UTF-16LE string embedded in the byte blob.
+fn decode_unit_table_key_from_blob(blob: &[u8]) -> Option<String> {
+    // Scan for "UT_" prefix in UTF-16LE: U=0x55 0x00, T=0x54 0x00, _=0x5F 0x00
+    let ut_prefix = [0x55u8, 0x00, 0x54, 0x00, 0x5F, 0x00];
+    for start in 0..blob.len().saturating_sub(6) {
+        if blob[start..start + 6] == ut_prefix {
+            if let Some(s) = extract_utf16le_string(&blob[start..]) {
+                if s.len() >= 4 {
+                    return Some(s);
+                }
+            }
+        }
+    }
+
+    // Also scan for other known UnitTable keys that don't start with "UT_"
+    // These are still valid UTF-16LE strings with alphabetic characters
+    // Look for any reasonable UTF-16LE string starting with uppercase letter followed by lowercase
+    for start in 0..blob.len().saturating_sub(8) {
+        let c0 = u16::from_le_bytes([blob[start], blob[start + 1]]);
+        let c1 = u16::from_le_bytes([blob[start + 2], blob[start + 3]]);
+        // Must start with uppercase letter
+        if (0x41..=0x5A).contains(&c0) && (0x61..=0x7A).contains(&c1) {
+            if let Some(s) = extract_utf16le_string(&blob[start..]) {
+                // Must contain '/' to be a compound key like "Arbeit/Masse"
+                // or be long enough to be meaningful
+                if s.len() >= 6 && s.contains('/') {
+                    return Some(s);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Extract a UTF-16LE string from bytes until null terminator or non-printable character
+fn extract_utf16le_string(blob: &[u8]) -> Option<String> {
+    let mut chars = Vec::new();
+    let mut j = 0;
+    while j + 1 < blob.len() {
+        let code = u16::from_le_bytes([blob[j], blob[j + 1]]);
+        if code == 0 || code > 0x7F {
+            break;
+        }
+        let ch = code as u8 as char;
+        if !ch.is_ascii_alphanumeric() && !"_/+%".contains(ch) {
+            break;
+        }
+        chars.push(ch);
+        j += 2;
+        if chars.len() >= 60 {
+            break;
+        }
+    }
+    if chars.is_empty() {
+        None
+    } else {
+        Some(chars.iter().collect())
+    }
 }
 
 fn decode_qs_valpar_f64(blob: &[u8]) -> Option<f64> {
