@@ -2,6 +2,10 @@
 name = "zs2fast"
 version = "0.1.0"
 edition = "2021"
+description = "Fast Rust/PyO3 parser for ZS2 files with Parquet export"
+license = "MIT"
+repository = "https://github.com/weltidom/zs2fast"
+homepage = "https://github.com/weltidom/zs2fast"
 
 [lib]
 name = "zs2fast"
