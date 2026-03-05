@@ -772,7 +772,16 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                         0x0005 => ("f64", 8usize),
                         0x0016 => ("u32", 4usize),
                         0x0011 => ("u8", 1usize),
-                        _ => ("unknown", 0usize),
+                        0x0000 => ("empty", 0usize),
+                        _ => {
+                            return Err(Zs2Error::Parse {
+                                offset: i,
+                                msg: format!(
+                                    "Unknown EE subtype 0x{sub:04X} in channel block at path {path}"
+                                ),
+                            }
+                            .into());
+                        }
                     };
 
                     let need = (cnt as usize) * bytes_per_item;
@@ -802,6 +811,11 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                     } else {
                         infer_unit_from_channel_name(&ch_name).to_string()
                     };
+
+                    if bytes_per_item == 0 {
+                        i += need;
+                        continue;
+                    }
 
                     // Extract values
                     for (tp, chunk) in blob.chunks(bytes_per_item).enumerate() {
@@ -868,7 +882,14 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                     }
                 }
                 0x0011 => 1,
-                _ => 0,
+                0x0000 => 0,
+                _ => {
+                    return Err(Zs2Error::Parse {
+                        offset: i,
+                        msg: format!("Unknown EE subtype 0x{sub:04X} at path {path}"),
+                    }
+                    .into())
+                }
             };
             let need = (cnt as usize) * bytes_per_item;
             ensure_len(i + need, n, i)?;
@@ -968,6 +989,7 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
         param_id: Option<u32>,
         short_name: String,
         param_name: String,
+        unit: String,
     }
 
     #[derive(Default)]
@@ -977,7 +999,14 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
         value_text: Option<String>,
     }
 
+    #[derive(Default)]
+    struct ChannelUnitEntry {
+        param_id: Option<u32>,
+        unit_name: String,
+    }
+
     let mut dict_by_elem: HashMap<u32, DictEntry> = HashMap::new();
+    let mut cm_units_by_elem: HashMap<u32, ChannelUnitEntry> = HashMap::new();
     let mut sample_params: HashMap<(u32, u32), SampleParam> = HashMap::new();
 
     let mut i = 4usize;
@@ -1009,7 +1038,14 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
         let leaf = path.rsplit('/').next().unwrap_or("");
         let sample_key = extract_direct_sample_parameter_key(&path);
         let in_global_dict = path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/");
+        let in_channel_manager =
+            path.contains("/SeriesDef/TestTaskDefs/") && path.contains("/ChannelManager/ChannelManager/Elem");
         let dict_elem_idx = if in_global_dict {
+            extract_elem_index(&path)
+        } else {
+            None
+        };
+        let cm_elem_idx = if in_channel_manager {
             extract_elem_index(&path)
         } else {
             None
@@ -1042,6 +1078,17 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
                         entry.param_name = text.trim().to_string();
                     } else if path.ends_with("/Kurzzeichen/Text") {
                         entry.short_name = text.trim().to_string();
+                    } else if path.ends_with("/EinheitName")
+                        || path.ends_with("/Einheit/Kurzzeichen")
+                    {
+                        entry.unit = text.trim().to_string();
+                    }
+                }
+
+                if let Some(elem_idx) = cm_elem_idx {
+                    if path.ends_with("/UnitTableName") || path.ends_with("/Einheit/Kurzzeichen") {
+                        cm_units_by_elem.entry(elem_idx).or_default().unit_name =
+                            text.trim().to_string();
                     }
                 }
             }
@@ -1057,6 +1104,12 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
                 if in_global_dict && path.ends_with("/ID") {
                     if let Some(elem_idx) = dict_elem_idx {
                         dict_by_elem.entry(elem_idx).or_default().param_id = Some(raw_u32);
+                    }
+                }
+
+                if in_channel_manager && path.ends_with("/ID") {
+                    if let Some(elem_idx) = cm_elem_idx {
+                        cm_units_by_elem.entry(elem_idx).or_default().param_id = Some(raw_u32);
                     }
                 }
 
@@ -1199,6 +1252,12 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
                     }
                 }
 
+                if in_channel_manager && path.ends_with("/ID") {
+                    if let Some(elem_idx) = cm_elem_idx {
+                        cm_units_by_elem.entry(elem_idx).or_default().param_id = Some(raw_u32);
+                    }
+                }
+
                 if let Some((s_idx, p_idx)) = sample_key {
                     let entry = sample_params.entry((s_idx, p_idx)).or_default();
                     if leaf == "ID" {
@@ -1217,6 +1276,12 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
                 if in_global_dict && path.ends_with("/ID") {
                     if let Some(elem_idx) = dict_elem_idx {
                         dict_by_elem.entry(elem_idx).or_default().param_id = Some(raw_u16 as u32);
+                    }
+                }
+
+                if in_channel_manager && path.ends_with("/ID") {
+                    if let Some(elem_idx) = cm_elem_idx {
+                        cm_units_by_elem.entry(elem_idx).or_default().param_id = Some(raw_u16 as u32);
                     }
                 }
 
@@ -1246,13 +1311,27 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
     let mut param_id_builder = UInt32Builder::new();
     let mut short_name_builder = StringBuilder::new();
     let mut param_name_builder = StringBuilder::new();
+    let mut unit_builder = StringBuilder::new();
     let mut value_builder = Float64Builder::new();
     let mut value_text_builder = StringBuilder::new();
 
-    let mut dict_by_param_id: HashMap<u32, (String, String)> = HashMap::new();
+    let mut dict_by_param_id: HashMap<u32, (String, String, String)> = HashMap::new();
     for (_, d) in dict_by_elem {
         if let Some(pid) = d.param_id {
-            dict_by_param_id.insert(pid, (d.short_name, d.param_name));
+            dict_by_param_id.insert(pid, (d.short_name, d.param_name, d.unit));
+        }
+    }
+
+    let mut cm_unit_by_param_id: HashMap<u32, String> = HashMap::new();
+    for (_, d) in cm_units_by_elem {
+        if let Some(pid) = d.param_id {
+            if !d.unit_name.trim().is_empty() {
+                let mut unit = d.unit_name.trim().to_string();
+                if let Some(mapped) = infer_unit_from_unit_table_name(&unit) {
+                    unit = mapped.to_string();
+                }
+                cm_unit_by_param_id.insert(pid, unit);
+            }
         }
     }
 
@@ -1261,15 +1340,22 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
 
     for ((sample_idx, _plist_idx), entry) in sorted_rows {
         if let Some(pid) = entry.param_id {
-            let (short_name, param_name) = dict_by_param_id
+            let (short_name, param_name, mut unit) = dict_by_param_id
                 .get(&pid)
                 .cloned()
-                .unwrap_or((String::new(), String::new()));
+                .unwrap_or((String::new(), String::new(), String::new()));
+
+            if unit.trim().is_empty() {
+                if let Some(cm_unit) = cm_unit_by_param_id.get(&pid) {
+                    unit = cm_unit.clone();
+                }
+            }
 
             sample_idx_builder.append_value(sample_idx);
             param_id_builder.append_value(pid);
             short_name_builder.append_value(short_name);
             param_name_builder.append_value(param_name);
+            unit_builder.append_value(unit);
 
             if let Some(val) = entry.value_numeric {
                 value_builder.append_value(val);
@@ -1290,6 +1376,7 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
         Field::new("param_id", DataType::UInt32, false),
         Field::new("short_name", DataType::Utf8, false),
         Field::new("param_name", DataType::Utf8, false),
+        Field::new("unit", DataType::Utf8, false),
         Field::new("value", DataType::Float64, true),
         Field::new("value_text", DataType::Utf8, true),
     ]));
@@ -1301,6 +1388,7 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
             std::sync::Arc::new(param_id_builder.finish()),
             std::sync::Arc::new(short_name_builder.finish()),
             std::sync::Arc::new(param_name_builder.finish()),
+            std::sync::Arc::new(unit_builder.finish()),
             std::sync::Arc::new(value_builder.finish()),
             std::sync::Arc::new(value_text_builder.finish()),
         ],
