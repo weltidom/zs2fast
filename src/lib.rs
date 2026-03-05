@@ -30,10 +30,47 @@ enum Zs2Error {
 
 type Res<T> = Result<T, Zs2Error>;
 
+const MAX_DECOMPRESSED_ZS2_BYTES: usize = 512 * 1024 * 1024;
+const MAX_UTF16_CHAR_COUNT: usize = 16_000_000;
+const MAX_ARRAY_ELEMENTS: usize = 50_000_000;
+const MAX_NESTING_DEPTH: usize = 512;
+
 impl From<Zs2Error> for PyErr {
     fn from(err: Zs2Error) -> PyErr {
         pyo3::exceptions::PyRuntimeError::new_err(err.to_string())
     }
+}
+
+fn read_zs2_with_limits(input_zs2: &str) -> Res<Vec<u8>> {
+    let f = File::open(input_zs2)?;
+    let mut gz = GzDecoder::new(BufReader::new(f));
+    let mut data = Vec::<u8>::new();
+    let mut chunk = [0u8; 64 * 1024];
+
+    loop {
+        let read = gz.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+
+        if data.len().saturating_add(read) > MAX_DECOMPRESSED_ZS2_BYTES {
+            return Err(Zs2Error::Parse {
+                offset: data.len(),
+                msg: format!(
+                    "decompressed input exceeds limit of {} bytes",
+                    MAX_DECOMPRESSED_ZS2_BYTES
+                ),
+            });
+        }
+
+        data.extend_from_slice(&chunk[..read]);
+    }
+
+    if data.len() < 4 || data[0..4] != [0xAF, 0xBE, 0xAD, 0xDE] {
+        return Err(Zs2Error::BadMarker);
+    }
+
+    Ok(data)
 }
 
 #[pyfunction]
@@ -45,16 +82,8 @@ fn zs2_to_parquet(
 ) -> PyResult<()> {
     let include_u32 = include_u32.unwrap_or(false);
 
-    // 1) Decompress gz (.zs2 is gzipped)
-    let f = File::open(input_zs2)?;
-    let mut gz = GzDecoder::new(BufReader::new(f));
-    let mut data = Vec::<u8>::new();
-    gz.read_to_end(&mut data)?;
-
-    // 2) Quick sanity: 0xDE AD BE AF (little-endian u32 -> bytes: AF BE AD DE)
-    if data.len() < 4 || data[0..4] != [0xAF, 0xBE, 0xAD, 0xDE] {
-        return Err(Zs2Error::BadMarker.into());
-    }
+    // 1) Decompress gz with safety limits and validate marker
+    let data = read_zs2_with_limits(input_zs2)?;
 
     // 3) Scan stream
     let mut i = 4usize;
@@ -100,6 +129,13 @@ fn zs2_to_parquet(
                 let cnt =
                     u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
                 i += 4;
+                if cnt > MAX_ARRAY_ELEMENTS {
+                    return Err(Zs2Error::Parse {
+                        offset: i,
+                        msg: format!("array element count {cnt} exceeds limit {MAX_ARRAY_ELEMENTS}"),
+                    }
+                    .into());
+                }
 
                 // Compose series name from current path + leaf name
                 let series = if name_stack.is_empty() {
@@ -208,6 +244,15 @@ fn zs2_to_parquet(
                 let raw = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                 i += 4;
                 let char_count = (raw & 0x7FFF_FFFF) as usize;
+                if char_count > MAX_UTF16_CHAR_COUNT {
+                    return Err(Zs2Error::Parse {
+                        offset: i,
+                        msg: format!(
+                            "UTF-16 char count {char_count} exceeds limit {MAX_UTF16_CHAR_COUNT}"
+                        ),
+                    }
+                    .into());
+                }
                 let need = char_count * 2;
                 ensure_len(i + need, n, i)?;
                 // We don't use the value here; just skip.
@@ -221,6 +266,13 @@ fn zs2_to_parquet(
                 let len = data[i + 1] as usize;
                 ensure_len(i + 2 + len, n, i)?;
                 i += 2 + len;
+                if name_stack.len() >= MAX_NESTING_DEPTH {
+                    return Err(Zs2Error::Parse {
+                        offset: i,
+                        msg: format!("nesting depth exceeds limit {MAX_NESTING_DEPTH}"),
+                    }
+                    .into());
+                }
                 name_stack.push(name);
             }
 
@@ -288,15 +340,8 @@ fn zs2_to_parquet(
 
 #[pyfunction]
 fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()> {
-    // 1) Decompress
-    let f = File::open(input_zs2)?;
-    let mut gz = GzDecoder::new(BufReader::new(f));
-    let mut data = Vec::<u8>::new();
-    gz.read_to_end(&mut data)?;
-
-    if data.len() < 4 || data[0..4] != [0xAF, 0xBE, 0xAD, 0xDE] {
-        return Err(Zs2Error::BadMarker.into());
-    }
+    // 1) Decompress with safety limits and validate marker
+    let data = read_zs2_with_limits(input_zs2)?;
 
     let n = data.len();
 
@@ -356,6 +401,16 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                 i += 2;
                 let cnt = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                 i += 4;
+                if cnt as usize > MAX_ARRAY_ELEMENTS {
+                    return Err(Zs2Error::Parse {
+                        offset: i,
+                        msg: format!(
+                            "array element count {} exceeds limit {}",
+                            cnt, MAX_ARRAY_ELEMENTS
+                        ),
+                    }
+                    .into());
+                }
 
                 // Extract parameter IDs from EigenschaftenListe
                 if is_eigenschaftenliste && path.ends_with("/ID") && sub == 0x0016 && cnt >= 1 {
@@ -397,6 +452,15 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                 let raw = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                 i += 4;
                 let char_count = (raw & 0x7FFF_FFFF) as usize;
+                if char_count > MAX_UTF16_CHAR_COUNT {
+                    return Err(Zs2Error::Parse {
+                        offset: i,
+                        msg: format!(
+                            "UTF-16 char count {char_count} exceeds limit {MAX_UTF16_CHAR_COUNT}"
+                        ),
+                    }
+                    .into());
+                }
                 let need = char_count * 2;
                 ensure_len(i + need, n, i)?;
 
@@ -468,6 +532,13 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                 let len = data[i + 1] as usize;
                 ensure_len(i + 2 + len, n, i)?;
                 i += 2 + len;
+                if name_stack.len() >= MAX_NESTING_DEPTH {
+                    return Err(Zs2Error::Parse {
+                        offset: i,
+                        msg: format!("nesting depth exceeds limit {MAX_NESTING_DEPTH}"),
+                    }
+                    .into());
+                }
                 name_stack.push(name);
             }
 
@@ -664,6 +735,16 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
             i += 2;
             let cnt = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
             i += 4;
+            if cnt as usize > MAX_ARRAY_ELEMENTS {
+                return Err(Zs2Error::Parse {
+                    offset: i,
+                    msg: format!(
+                        "array element count {} exceeds limit {}",
+                        cnt, MAX_ARRAY_ELEMENTS
+                    ),
+                }
+                .into());
+            }
 
             // Check if this is a real-time capture channel
             if path.contains("/DataChannels/") && path.contains("RealTimeCapture/Trs/SingleGroupDataBlock") {
@@ -778,6 +859,15 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
             let raw = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
             i += 4;
             let char_count = (raw & 0x7FFF_FFFF) as usize;
+            if char_count > MAX_UTF16_CHAR_COUNT {
+                return Err(Zs2Error::Parse {
+                    offset: i,
+                    msg: format!(
+                        "UTF-16 char count {char_count} exceeds limit {MAX_UTF16_CHAR_COUNT}"
+                    ),
+                }
+                .into());
+            }
             let need = char_count * 2;
             ensure_len(i + need, n, i)?;
             i += need;
@@ -786,6 +876,13 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
             let len = data[i + 1] as usize;
             ensure_len(i + 2 + len, n, i)?;
             i += 2 + len;
+            if name_stack.len() >= MAX_NESTING_DEPTH {
+                return Err(Zs2Error::Parse {
+                    offset: i,
+                    msg: format!("nesting depth exceeds limit {MAX_NESTING_DEPTH}"),
+                }
+                .into());
+            }
             name_stack.push(name);
         } else {
             match dtype {
@@ -844,14 +941,7 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
 /// Extract evaluated parameters from EigenschaftenListe to Parquet
 #[pyfunction]
 fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()> {
-    let f = File::open(input_zs2)?;
-    let mut gz = GzDecoder::new(BufReader::new(f));
-    let mut data = Vec::<u8>::new();
-    gz.read_to_end(&mut data)?;
-
-    if data.len() < 4 || data[0..4] != [0xAF, 0xBE, 0xAD, 0xDE] {
-        return Err(Zs2Error::BadMarker.into());
-    }
+    let data = read_zs2_with_limits(input_zs2)?;
 
     #[derive(Default)]
     struct DictEntry {
@@ -908,6 +998,15 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
                 let raw = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                 i += 4;
                 let char_count = (raw & 0x7FFF_FFFF) as usize;
+                if char_count > MAX_UTF16_CHAR_COUNT {
+                    return Err(Zs2Error::Parse {
+                        offset: i,
+                        msg: format!(
+                            "UTF-16 char count {char_count} exceeds limit {MAX_UTF16_CHAR_COUNT}"
+                        ),
+                    }
+                    .into());
+                }
                 let need = char_count * 2;
                 ensure_len(i + need, n, i)?;
                 let text = decode_utf16le(&data[i..i + need])?;
@@ -986,6 +1085,13 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
                 let len = data[i + 1] as usize;
                 ensure_len(i + 2 + len, n, i)?;
                 i += 2 + len;
+                if name_stack.len() >= MAX_NESTING_DEPTH {
+                    return Err(Zs2Error::Parse {
+                        offset: i,
+                        msg: format!("nesting depth exceeds limit {MAX_NESTING_DEPTH}"),
+                    }
+                    .into());
+                }
                 name_stack.push(name);
             }
 
@@ -996,6 +1102,16 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
                 i += 2;
                 let cnt = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                 i += 4;
+                if cnt as usize > MAX_ARRAY_ELEMENTS {
+                    return Err(Zs2Error::Parse {
+                        offset: i,
+                        msg: format!(
+                            "array element count {} exceeds limit {}",
+                            cnt, MAX_ARRAY_ELEMENTS
+                        ),
+                    }
+                    .into());
+                }
 
                 let bytes_per_item = match sub {
                     0x0004 | 0x0016 => 4,
@@ -1440,14 +1556,7 @@ fn is_likely_value_leaf(leaf: &str) -> bool {
 /// Document/Body/batch/Series/SeriesElements/Elem{sample}/.../EvalContext/ParamContext/ParameterListe/Elem{param}
 #[pyfunction]
 fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()> {
-    let f = File::open(input_zs2)?;
-    let mut gz = GzDecoder::new(BufReader::new(f));
-    let mut data = Vec::<u8>::new();
-    gz.read_to_end(&mut data)?;
-
-    if data.len() < 4 || data[0..4] != [0xAF, 0xBE, 0xAD, 0xDE] {
-        return Err(Zs2Error::BadMarker.into());
-    }
+    let data = read_zs2_with_limits(input_zs2)?;
 
     #[derive(Default, Clone)]
     struct ResultData {
@@ -1496,6 +1605,15 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
                 let raw = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                 i += 4;
                 let char_count = (raw & 0x7FFF_FFFF) as usize;
+                if char_count > MAX_UTF16_CHAR_COUNT {
+                    return Err(Zs2Error::Parse {
+                        offset: i,
+                        msg: format!(
+                            "UTF-16 char count {char_count} exceeds limit {MAX_UTF16_CHAR_COUNT}"
+                        ),
+                    }
+                    .into());
+                }
                 let need = char_count * 2;
                 ensure_len(i + need, n, i)?;
                 let text = decode_utf16le(&data[i..i + need])?;
@@ -1583,6 +1701,13 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
                 let len = data[i + 1] as usize;
                 ensure_len(i + 2 + len, n, i)?;
                 i += 2 + len;
+                if name_stack.len() >= MAX_NESTING_DEPTH {
+                    return Err(Zs2Error::Parse {
+                        offset: i,
+                        msg: format!("nesting depth exceeds limit {MAX_NESTING_DEPTH}"),
+                    }
+                    .into());
+                }
                 name_stack.push(name);
             }
 
@@ -1593,6 +1718,16 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
                 i += 2;
                 let cnt = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                 i += 4;
+                if cnt as usize > MAX_ARRAY_ELEMENTS {
+                    return Err(Zs2Error::Parse {
+                        offset: i,
+                        msg: format!(
+                            "array element count {} exceeds limit {}",
+                            cnt, MAX_ARRAY_ELEMENTS
+                        ),
+                    }
+                    .into());
+                }
 
                 let bytes_per_item: usize = match sub {
                     0x0004 | 0x0016 => 4,

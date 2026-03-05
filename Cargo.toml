@@ -8,7 +8,7 @@ name = "zs2fast"
 crate-type = ["cdylib"]   # for Python extension
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
+pyo3 = { version = "0.24.1", features = ["extension-module", "abi3-py39"] }
 flate2 = "1"
 thiserror = "1"
 # Arrow/Parquet: keep versions aligned
