@@ -50,18 +50,18 @@ zs2fast.zs2_channels_to_parquet("input.zs2", "channels.parquet")
 channels = pl.read_parquet("channels.parquet")
 print(channels.filter(pl.col('unit').is_not_null()).head())
 
-# Export evaluated parameters with automatic unit resolution
+# Export calculated test results (Bruchbild, elongation, max force, etc.)
 # Units are resolved from EinheitName → QS_ValSetting blob → UnitTables
 zs2fast.zs2_evaluated_params_to_parquet("input.zs2", "evaluated_params.parquet")
 # columns: sample_idx, param_id, short_name, param_name, unit, value, value_text
 params = pl.read_parquet("evaluated_params.parquet")
 print(params.filter(pl.col('value').is_not_null()).head())
 
-# Extract per-sample test results (Bruchbild, elongation, etc.)
-zs2fast.zs2_parameterliste_results_to_parquet("input.zs2", "sample_results.parquet")
+# Extract per-sample test settings and parameters (not calculated results)
+zs2fast.zs2_parameterliste_results_to_parquet("input.zs2", "sample_params.parquet")
 # columns: sample_id, result_id, result_name, unit, value_text, value
-results = pl.read_parquet("sample_results.parquet")
-print(results.head())
+sample_params = pl.read_parquet("sample_params.parquet")
+print(sample_params.head())
 ```
 
 ## Unit Resolution

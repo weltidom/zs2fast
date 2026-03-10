@@ -1780,13 +1780,15 @@ fn decode_utf16le(bytes: &[u8]) -> Res<String> {
     if !bytes.len().is_multiple_of(2) {
         return Ok(String::new());
     }
-    let mut result = String::new();
+    
+    // Convert bytes to u16 code units
+    let mut code_units: Vec<u16> = Vec::with_capacity(bytes.len() / 2);
     for chunk in bytes.chunks_exact(2) {
-        let code_point = u16::from_le_bytes([chunk[0], chunk[1]]);
-        if let Some(c) = char::from_u32(code_point as u32) {
-            result.push(c);
-        }
+        code_units.push(u16::from_le_bytes([chunk[0], chunk[1]]));
     }
+    
+    // Use Rust's built-in UTF-16 decoder which properly handles surrogate pairs
+    let result = String::from_utf16_lossy(&code_units);
     Ok(result.trim_end_matches('\0').to_string())
 }
 
