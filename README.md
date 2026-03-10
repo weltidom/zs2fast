@@ -82,6 +82,10 @@ Channels typically use tier 1–2, while evaluated parameters primarily use tier
 maturin build --release
 ```
 
+Note: for this PyO3 extension module on macOS, prefer `maturin build`/`maturin develop`.
+Running plain `cargo build --release` can fail with unresolved Python symbols
+(`_Py*`, `__Py_*`) during linking.
+
 ### Lint
 
 ```bash

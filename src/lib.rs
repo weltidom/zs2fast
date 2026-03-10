@@ -1829,7 +1829,7 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
         unit: String,
     }
 
-    let mut results_by_key: HashMap<(u32, u32), ResultData> = HashMap::new();
+    let mut results_by_key: HashMap<(u32, u32, u8), ResultData> = HashMap::new();
     let mut global_defs_by_elem: HashMap<u32, GlobalDefData> = HashMap::new();
 
     let mut i = 4usize;
@@ -1837,8 +1837,7 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
     let mut name_stack: Vec<String> = Vec::with_capacity(8);
 
     let is_direct_result_id_path = |path: &str| {
-        // Use rsplit_once to match the MOST DIRECT (closest to leaf) ParameterListe/Elem occurrence
-        if let Some((_, rest)) = path.rsplit_once("/EvalContext/ParamContext/ParameterListe/Elem") {
+        if let Some((_, rest)) = path.split_once("/EvalContext/ParamContext/ParameterListe/Elem") {
             let digits_len = rest.chars().take_while(|c| c.is_ascii_digit()).count();
             if digits_len == 0 {
                 return false;
@@ -1884,16 +1883,25 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
         let path_depth = path.matches('/').count();
         
         // Extract key using lenient matching (allows other nodes between markers)
-        // Use rsplit_once for ParameterListe/Elem to match the most direct (deepest) occurrence
+        // Use split_once for ParameterListe/Elem to keep the data-level element index.
         let key = if let Some((_, rest)) = path.split_once("/SeriesElements/Elem") {
             let sample_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
             if !sample_digits.is_empty() && sample_digits.len() < 20 {
                 let sample_idx = if let Ok(n) = sample_digits.parse::<u32>() { n } else { return Err(Zs2Error::Parse { offset: i, msg: "invalid sample idx".to_string() }.into()); };
-                if let Some((_, rest2)) = path.rsplit_once("/EvalContext/ParamContext/ParameterListe/Elem") {
+                let after_sample = &rest[sample_digits.len()..];
+                let param_tail = after_sample
+                    .split_once("/SeriesElements/Elem0/EvalContext/ParamContext/ParameterListe/Elem")
+                    .map(|(_, t)| (t, 2u8))
+                    .or_else(|| {
+                        after_sample
+                            .split_once("/EvalContext/ParamContext/ParameterListe/Elem")
+                            .map(|(_, t)| (t, 1u8))
+                    });
+                if let Some((rest2, branch_rank)) = param_tail {
                     let plist_digits: String = rest2.chars().take_while(|c| c.is_ascii_digit()).collect();
                     if !plist_digits.is_empty() && plist_digits.len() < 20 {
                         if let Ok(param_idx) = plist_digits.parse::<u32>() {
-                            Some((sample_idx, param_idx))
+                            Some((sample_idx, param_idx, branch_rank))
                         } else { None }
                     } else { None }
                 } else { None }
@@ -2065,7 +2073,11 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
 
                 if let Some(k) = key {
                     if is_direct_result_id_path(&path) {
-                        results_by_key.entry(k).or_default().param_id = Some(val);
+                        let entry = results_by_key.entry(k).or_default();
+                        if entry.param_id.is_none() || path_depth < entry.param_id_depth {
+                            entry.param_id = Some(val);
+                            entry.param_id_depth = path_depth;
+                        }
                     }
                 } else if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/")
                     && is_direct_global_id_path(&path)
@@ -2084,7 +2096,11 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
                 if is_direct_result_id_path(&path) || is_direct_global_id_path(&path) {
                     if let Some(k) = key {
                         if is_direct_result_id_path(&path) {
-                            results_by_key.entry(k).or_default().param_id = Some(val);
+                            let entry = results_by_key.entry(k).or_default();
+                            if entry.param_id.is_none() || path_depth < entry.param_id_depth {
+                                entry.param_id = Some(val);
+                                entry.param_id_depth = path_depth;
+                            }
                         }
                     } else if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/")
                         && is_direct_global_id_path(&path)
@@ -2104,7 +2120,11 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
                 if is_direct_result_id_path(&path) || is_direct_global_id_path(&path) {
                     if let Some(k) = key {
                         if is_direct_result_id_path(&path) {
-                            results_by_key.entry(k).or_default().param_id = Some(val);
+                            let entry = results_by_key.entry(k).or_default();
+                            if entry.param_id.is_none() || path_depth < entry.param_id_depth {
+                                entry.param_id = Some(val);
+                                entry.param_id_depth = path_depth;
+                            }
                         }
                     } else if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/")
                         && is_direct_global_id_path(&path)
@@ -2124,7 +2144,11 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
                 if is_direct_result_id_path(&path) || is_direct_global_id_path(&path) {
                     if let Some(k) = key {
                         if is_direct_result_id_path(&path) {
-                            results_by_key.entry(k).or_default().param_id = Some(val);
+                            let entry = results_by_key.entry(k).or_default();
+                            if entry.param_id.is_none() || path_depth < entry.param_id_depth {
+                                entry.param_id = Some(val);
+                                entry.param_id_depth = path_depth;
+                            }
                         }
                     } else if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/")
                         && is_direct_global_id_path(&path)
@@ -2154,7 +2178,9 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
     let mut value_builder = Float64Builder::new();
 
     let mut sorted_results: Vec<_> = results_by_key.into_iter().collect();
-    sorted_results.sort_by_key(|((sample_id, result_id), _)| (*sample_id, *result_id));
+    sorted_results.sort_by_key(|((sample_id, result_id, branch), _)| {
+        (*sample_id, *result_id, *branch)
+    });
 
     let mut global_param_defs: HashMap<u32, (String, String)> = HashMap::new();
     for def in global_defs_by_elem.values() {
@@ -2163,7 +2189,7 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
         }
     }
 
-    for ((sample_id, elem_idx), result_data) in sorted_results {
+    for ((sample_id, elem_idx, _branch), result_data) in sorted_results {
         let result_id = result_data.param_id.unwrap_or(elem_idx);
 
         let (def_name, def_unit) = global_param_defs
