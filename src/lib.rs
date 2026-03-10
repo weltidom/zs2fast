@@ -1025,6 +1025,13 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
     let n = data.len();
     let mut name_stack: Vec<String> = Vec::with_capacity(8);
 
+    // Strict path validators to prevent ID mismatches from nested structures
+    let is_direct_param_id = |path: &str| {
+        path.contains("/EvalContext/ParamContext/ParameterListe/Elem")
+            && path.rsplit('/').next() == Some("ID")
+            && path.matches("/ParameterListe/Elem").count() == 1
+    };
+
     while i < n {
         if data[i] == 0xFF {
             if !name_stack.is_empty() {
@@ -1178,7 +1185,7 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
 
                 if let Some((s_idx, p_idx)) = sample_key {
                     let entry = sample_params.entry((s_idx, p_idx)).or_default();
-                    if leaf == "ID" {
+                    if is_direct_param_id(&path) {
                         entry.param_id = Some(val as u32);
                     } else if is_likely_value_leaf(leaf) {
                         entry.value_numeric = Some(val);
@@ -1203,7 +1210,7 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
 
                 if let Some((s_idx, p_idx)) = sample_key {
                     let entry = sample_params.entry((s_idx, p_idx)).or_default();
-                    if leaf == "ID" {
+                    if is_direct_param_id(&path) {
                         entry.param_id = Some(val as u32);
                     } else if is_likely_value_leaf(leaf) {
                         entry.value_numeric = Some(val);
@@ -1260,18 +1267,20 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
                 let need = (cnt as usize) * bytes_per_item;
                 ensure_len(i + need, n, i)?;
 
-                if sub == 0x0016 && cnt >= 1 && need >= 4 && leaf == "ID" {
+                if sub == 0x0016 && cnt >= 1 && need >= 4 {
                     let raw_u32 =
                         u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
 
-                    if in_global_dict {
+                    if in_global_dict && path.ends_with("/ID") {
                         if let Some(elem_idx) = dict_elem_idx {
                             dict_by_elem.entry(elem_idx).or_default().param_id = Some(raw_u32);
                         }
                     }
 
-                    if let Some((s_idx, p_idx)) = sample_key {
-                        sample_params.entry((s_idx, p_idx)).or_default().param_id = Some(raw_u32);
+                    if is_direct_param_id(&path) {
+                        if let Some((s_idx, p_idx)) = sample_key {
+                            sample_params.entry((s_idx, p_idx)).or_default().param_id = Some(raw_u32);
+                        }
                     }
                 }
 
@@ -1323,7 +1332,7 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
 
                 if let Some((s_idx, p_idx)) = sample_key {
                     let entry = sample_params.entry((s_idx, p_idx)).or_default();
-                    if leaf == "ID" {
+                    if is_direct_param_id(&path) {
                         entry.param_id = Some(raw_u32);
                     } else if is_likely_value_leaf(leaf) {
                         entry.value_numeric = Some(val);
@@ -1351,7 +1360,7 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
 
                 if let Some((s_idx, p_idx)) = sample_key {
                     let entry = sample_params.entry((s_idx, p_idx)).or_default();
-                    if leaf == "ID" {
+                    if is_direct_param_id(&path) {
                         entry.param_id = Some(raw_u16 as u32);
                     } else if is_likely_value_leaf(leaf) {
                         entry.value_numeric = Some(raw_u16 as f64);
@@ -1748,31 +1757,6 @@ fn decode_utf16le(bytes: &[u8]) -> Res<String> {
     Ok(result.trim_end_matches('\0').to_string())
 }
 
-fn extract_sample_and_parameter_index(path: &str) -> Option<(u32, u32)> {
-    let sample_idx = if let Some((_, rest)) = path.split_once("/SeriesElements/Elem") {
-        let sample_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if sample_digits.is_empty() {
-            return None;
-        }
-        sample_digits.parse::<u32>().ok()?
-    } else {
-        return None;
-    };
-
-    let param_idx =
-        if let Some((_, rest)) = path.split_once("/EvalContext/ParamContext/ParameterListe/Elem") {
-            let param_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if param_digits.is_empty() {
-                return None;
-            }
-            param_digits.parse::<u32>().ok()?
-        } else {
-            return None;
-        };
-
-    Some((sample_idx, param_idx))
-}
-
 fn decode_numeric_from_qs_valpar(blob: &[u8]) -> Option<f64> {
     // QS_ValPar format: [header_byte][f64_value][optional_text]
     // The f64 is at offset 1, not 0
@@ -1850,6 +1834,28 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
     let n = data.len();
     let mut name_stack: Vec<String> = Vec::with_capacity(8);
 
+    let is_direct_result_id_path = |path: &str| {
+        if let Some((_, rest)) = path.split_once("/EvalContext/ParamContext/ParameterListe/Elem") {
+            let digits_len = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+            if digits_len == 0 {
+                return false;
+            }
+            return rest[digits_len..].eq_ignore_ascii_case("/ID");
+        }
+        false
+    };
+
+    let is_direct_global_id_path = |path: &str| {
+        if let Some((_, rest)) = path.rsplit_once("/EigenschaftenListe/Elem") {
+            let digits_len = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+            if digits_len == 0 {
+                return false;
+            }
+            return rest[digits_len..].eq_ignore_ascii_case("/ID");
+        }
+        false
+    };
+
     while i < n {
         if data[i] == 0xFF {
             if !name_stack.is_empty() {
@@ -1873,7 +1879,23 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
         let dtype = data[i];
         let path = name_stack.join("/") + "/" + &name;
         let path_depth = path.matches('/').count();
-        let key = extract_sample_and_parameter_index(&path);
+        
+        // Extract key using lenient matching (allows other nodes between markers)
+        let key = if let Some((_, rest)) = path.split_once("/SeriesElements/Elem") {
+            let sample_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !sample_digits.is_empty() && sample_digits.len() < 20 {
+                let sample_idx = if let Ok(n) = sample_digits.parse::<u32>() { n } else { return Err(Zs2Error::Parse { offset: i, msg: "invalid sample idx".to_string() }.into()); };
+                if let Some((_, rest2)) = path.split_once("/EvalContext/ParamContext/ParameterListe/Elem") {
+                    let plist_digits: String = rest2.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if !plist_digits.is_empty() && plist_digits.len() < 20 {
+                        if let Ok(param_idx) = plist_digits.parse::<u32>() {
+                            Some((sample_idx, param_idx))
+                        } else { None }
+                    } else { None }
+                } else { None }
+            } else { None }
+        } else { None };
+        
         let leaf = path.rsplit('/').next().unwrap_or("");
 
         match dtype {
@@ -1934,11 +1956,11 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
                 i += 4;
 
                 if let Some(k) = key {
-                    if leaf.eq_ignore_ascii_case("ID") && val >= 0 {
+                    if is_direct_result_id_path(&path) && val >= 0 {
                         results_by_key.entry(k).or_default().param_id = Some(val as u32);
                     }
                 } else if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/")
-                    && leaf.eq_ignore_ascii_case("ID")
+                    && is_direct_global_id_path(&path)
                     && val >= 0
                 {
                     if let Some(param_idx) = extract_elem_index(&path) {
@@ -2034,11 +2056,11 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
                 i += 4;
 
                 if let Some(k) = key {
-                    if leaf.eq_ignore_ascii_case("ID") {
+                    if is_direct_result_id_path(&path) {
                         results_by_key.entry(k).or_default().param_id = Some(val);
                     }
                 } else if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/")
-                    && leaf.eq_ignore_ascii_case("ID")
+                    && is_direct_global_id_path(&path)
                 {
                     if let Some(param_idx) = extract_elem_index(&path) {
                         global_defs_by_elem.entry(param_idx).or_default().param_id = Some(val);
@@ -2051,10 +2073,13 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
                 let val = u16::from_le_bytes([data[i], data[i + 1]]) as u32;
                 i += 2;
 
-                if leaf.eq_ignore_ascii_case("ID") {
+                if is_direct_result_id_path(&path) || is_direct_global_id_path(&path) {
                     if let Some(k) = key {
-                        results_by_key.entry(k).or_default().param_id = Some(val);
+                        if is_direct_result_id_path(&path) {
+                            results_by_key.entry(k).or_default().param_id = Some(val);
+                        }
                     } else if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/")
+                        && is_direct_global_id_path(&path)
                     {
                         if let Some(param_idx) = extract_elem_index(&path) {
                             global_defs_by_elem.entry(param_idx).or_default().param_id = Some(val);
@@ -2068,10 +2093,13 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
                 let val = data[i] as u32;
                 i += 1;
 
-                if leaf.eq_ignore_ascii_case("ID") {
+                if is_direct_result_id_path(&path) || is_direct_global_id_path(&path) {
                     if let Some(k) = key {
-                        results_by_key.entry(k).or_default().param_id = Some(val);
+                        if is_direct_result_id_path(&path) {
+                            results_by_key.entry(k).or_default().param_id = Some(val);
+                        }
                     } else if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/")
+                        && is_direct_global_id_path(&path)
                     {
                         if let Some(param_idx) = extract_elem_index(&path) {
                             global_defs_by_elem.entry(param_idx).or_default().param_id = Some(val);
@@ -2085,10 +2113,13 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
                 let val = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                 i += 4;
 
-                if leaf.eq_ignore_ascii_case("ID") {
+                if is_direct_result_id_path(&path) || is_direct_global_id_path(&path) {
                     if let Some(k) = key {
-                        results_by_key.entry(k).or_default().param_id = Some(val);
+                        if is_direct_result_id_path(&path) {
+                            results_by_key.entry(k).or_default().param_id = Some(val);
+                        }
                     } else if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/")
+                        && is_direct_global_id_path(&path)
                     {
                         if let Some(param_idx) = extract_elem_index(&path) {
                             global_defs_by_elem.entry(param_idx).or_default().param_id = Some(val);
