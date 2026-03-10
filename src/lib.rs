@@ -1907,13 +1907,12 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
                             entry.name = trimmed.to_string();
                             entry.name_depth = path_depth;
                         }
-                    } else if path.ends_with("/EinheitName") {
-                        if !trimmed.is_empty()
-                            && (entry.unit.is_empty() || path_depth < entry.unit_depth)
-                        {
-                            entry.unit = trimmed.to_string();
-                            entry.unit_depth = path_depth;
-                        }
+                    } else if path.ends_with("/EinheitName")
+                        && !trimmed.is_empty()
+                        && (entry.unit.is_empty() || path_depth < entry.unit_depth)
+                    {
+                        entry.unit = trimmed.to_string();
+                        entry.unit_depth = path_depth;
                     }
                 } else if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/") {
                     if let Some(param_idx) = extract_elem_index(&path) {
