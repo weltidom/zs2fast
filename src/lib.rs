@@ -1840,15 +1840,15 @@ fn decode_first_utf16_segment_from_blob(blob: &[u8]) -> Option<String> {
             continue;
         }
 
-        if let Ok(decoded) = String::from_utf16(&units) {
-            let trimmed = decoded.trim();
-            if trimmed.len() >= 2
-                && trimmed
-                    .chars()
-                    .any(|c| c.is_alphabetic() || "äöüÄÖÜß".contains(c))
-            {
-                return Some(trimmed.to_string());
-            }
+        // Use lossy decoder to properly handle surrogate pairs
+        let decoded = String::from_utf16_lossy(&units);
+        let trimmed = decoded.trim();
+        if trimmed.len() >= 2
+            && trimmed
+                .chars()
+                .any(|c| c.is_alphabetic() || "äöüÄÖÜß".contains(c))
+        {
+            return Some(trimmed.to_string());
         }
     }
 
