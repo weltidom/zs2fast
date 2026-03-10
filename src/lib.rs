@@ -1794,6 +1794,7 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
     #[derive(Clone)]
     struct ResultData {
         param_id: Option<u32>,
+        param_id_depth: usize,
         name: String,
         unit: String,
         value_text: Option<String>,
@@ -1808,6 +1809,7 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
         fn default() -> Self {
             Self {
                 param_id: None,
+                param_id_depth: usize::MAX,
                 name: String::new(),
                 unit: String::new(),
                 value_text: None,
@@ -1835,7 +1837,8 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
     let mut name_stack: Vec<String> = Vec::with_capacity(8);
 
     let is_direct_result_id_path = |path: &str| {
-        if let Some((_, rest)) = path.split_once("/EvalContext/ParamContext/ParameterListe/Elem") {
+        // Use rsplit_once to match the MOST DIRECT (closest to leaf) ParameterListe/Elem occurrence
+        if let Some((_, rest)) = path.rsplit_once("/EvalContext/ParamContext/ParameterListe/Elem") {
             let digits_len = rest.chars().take_while(|c| c.is_ascii_digit()).count();
             if digits_len == 0 {
                 return false;
@@ -1881,11 +1884,12 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
         let path_depth = path.matches('/').count();
         
         // Extract key using lenient matching (allows other nodes between markers)
+        // Use rsplit_once for ParameterListe/Elem to match the most direct (deepest) occurrence
         let key = if let Some((_, rest)) = path.split_once("/SeriesElements/Elem") {
             let sample_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
             if !sample_digits.is_empty() && sample_digits.len() < 20 {
                 let sample_idx = if let Ok(n) = sample_digits.parse::<u32>() { n } else { return Err(Zs2Error::Parse { offset: i, msg: "invalid sample idx".to_string() }.into()); };
-                if let Some((_, rest2)) = path.split_once("/EvalContext/ParamContext/ParameterListe/Elem") {
+                if let Some((_, rest2)) = path.rsplit_once("/EvalContext/ParamContext/ParameterListe/Elem") {
                     let plist_digits: String = rest2.chars().take_while(|c| c.is_ascii_digit()).collect();
                     if !plist_digits.is_empty() && plist_digits.len() < 20 {
                         if let Ok(param_idx) = plist_digits.parse::<u32>() {
@@ -1957,7 +1961,11 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
 
                 if let Some(k) = key {
                     if is_direct_result_id_path(&path) && val >= 0 {
-                        results_by_key.entry(k).or_default().param_id = Some(val as u32);
+                        let entry = results_by_key.entry(k).or_default();
+                        if entry.param_id.is_none() || path_depth < entry.param_id_depth {
+                            entry.param_id = Some(val as u32);
+                            entry.param_id_depth = path_depth;
+                        }
                     }
                 } else if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/")
                     && is_direct_global_id_path(&path)
