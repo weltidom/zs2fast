@@ -81,10 +81,7 @@ fn emit_deprecation_warning(py: Python<'_>, old_name: &str, new_name: &str) -> P
         "'{}' is deprecated and will be removed in a future release; use '{}' instead.",
         old_name, new_name
     );
-    warnings.call_method1(
-        "warn",
-        (msg, py.get_type::<PyDeprecationWarning>(), 2usize),
-    )?;
+    warnings.call_method1("warn", (msg, py.get_type::<PyDeprecationWarning>(), 2usize))?;
     Ok(())
 }
 
@@ -1011,7 +1008,6 @@ fn zs2_evaluated_params_to_parquet(
 }
 
 fn export_enriched_params_impl(input_zs2: &str, output_parquet: &str) -> PyResult<()> {
-
     let data = read_zs2_with_limits(input_zs2)?;
 
     #[derive(Default)]
@@ -1309,7 +1305,8 @@ fn export_enriched_params_impl(input_zs2: &str, output_parquet: &str) -> PyResul
 
                     if is_direct_param_id(&path) {
                         if let Some((s_idx, p_idx)) = sample_key {
-                            sample_params.entry((s_idx, p_idx)).or_default().param_id = Some(raw_u32);
+                            sample_params.entry((s_idx, p_idx)).or_default().param_id =
+                                Some(raw_u32);
                         }
                     }
                 }
@@ -1839,7 +1836,6 @@ fn zs2_parameterliste_results_to_parquet(
 }
 
 fn export_sample_results_impl(input_zs2: &str, output_parquet: &str) -> PyResult<()> {
-
     let data = read_zs2_with_limits(input_zs2)?;
 
     #[derive(Clone)]
@@ -1932,16 +1928,26 @@ fn export_sample_results_impl(input_zs2: &str, output_parquet: &str) -> PyResult
         let dtype = data[i];
         let path = name_stack.join("/") + "/" + &name;
         let path_depth = path.matches('/').count();
-        
+
         // Extract key using lenient matching (allows other nodes between markers)
         // Use split_once for ParameterListe/Elem to keep the data-level element index.
         let key = if let Some((_, rest)) = path.split_once("/SeriesElements/Elem") {
             let sample_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
             if !sample_digits.is_empty() && sample_digits.len() < 20 {
-                let sample_idx = if let Ok(n) = sample_digits.parse::<u32>() { n } else { return Err(Zs2Error::Parse { offset: i, msg: "invalid sample idx".to_string() }.into()); };
+                let sample_idx = if let Ok(n) = sample_digits.parse::<u32>() {
+                    n
+                } else {
+                    return Err(Zs2Error::Parse {
+                        offset: i,
+                        msg: "invalid sample idx".to_string(),
+                    }
+                    .into());
+                };
                 let after_sample = &rest[sample_digits.len()..];
                 let param_tail = after_sample
-                    .split_once("/SeriesElements/Elem0/EvalContext/ParamContext/ParameterListe/Elem")
+                    .split_once(
+                        "/SeriesElements/Elem0/EvalContext/ParamContext/ParameterListe/Elem",
+                    )
                     .map(|(_, t)| (t, 2u8))
                     .or_else(|| {
                         after_sample
@@ -1949,16 +1955,27 @@ fn export_sample_results_impl(input_zs2: &str, output_parquet: &str) -> PyResult
                             .map(|(_, t)| (t, 1u8))
                     });
                 if let Some((rest2, branch_rank)) = param_tail {
-                    let plist_digits: String = rest2.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    let plist_digits: String =
+                        rest2.chars().take_while(|c| c.is_ascii_digit()).collect();
                     if !plist_digits.is_empty() && plist_digits.len() < 20 {
                         if let Ok(param_idx) = plist_digits.parse::<u32>() {
                             Some((sample_idx, param_idx, branch_rank))
-                        } else { None }
-                    } else { None }
-                } else { None }
-            } else { None }
-        } else { None };
-        
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let leaf = path.rsplit('/').next().unwrap_or("");
 
         match dtype {
@@ -2229,9 +2246,8 @@ fn export_sample_results_impl(input_zs2: &str, output_parquet: &str) -> PyResult
     let mut value_builder = Float64Builder::new();
 
     let mut sorted_results: Vec<_> = results_by_key.into_iter().collect();
-    sorted_results.sort_by_key(|((sample_id, result_id, branch), _)| {
-        (*sample_id, *result_id, *branch)
-    });
+    sorted_results
+        .sort_by_key(|((sample_id, result_id, branch), _)| (*sample_id, *result_id, *branch));
 
     let mut global_param_defs: HashMap<u32, (String, String)> = HashMap::new();
     for def in global_defs_by_elem.values() {
