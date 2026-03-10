@@ -1,5 +1,7 @@
 use flate2::read::GzDecoder;
+use pyo3::exceptions::PyDeprecationWarning;
 use pyo3::prelude::*;
+use pyo3::types::PyModule;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -71,6 +73,19 @@ fn read_zs2_with_limits(input_zs2: &str) -> Res<Vec<u8>> {
     }
 
     Ok(data)
+}
+
+fn emit_deprecation_warning(py: Python<'_>, old_name: &str, new_name: &str) -> PyResult<()> {
+    let warnings = PyModule::import(py, "warnings")?;
+    let msg = format!(
+        "'{}' is deprecated and will be removed in a future release; use '{}' instead.",
+        old_name, new_name
+    );
+    warnings.call_method1(
+        "warn",
+        (msg, py.get_type::<PyDeprecationWarning>(), 2usize),
+    )?;
+    Ok(())
 }
 
 #[pyfunction]
@@ -981,7 +996,22 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
 
 /// Extract evaluated parameters from EigenschaftenListe to Parquet
 #[pyfunction]
-fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()> {
+fn zs2_evaluated_params_to_parquet(
+    py: Python<'_>,
+    input_zs2: &str,
+    output_parquet: &str,
+) -> PyResult<()> {
+    emit_deprecation_warning(
+        py,
+        "zs2_evaluated_params_to_parquet",
+        "zs2_export_enriched_params_to_parquet",
+    )?;
+
+    export_enriched_params_impl(input_zs2, output_parquet)
+}
+
+fn export_enriched_params_impl(input_zs2: &str, output_parquet: &str) -> PyResult<()> {
+
     let data = read_zs2_with_limits(input_zs2)?;
 
     #[derive(Default)]
@@ -1516,6 +1546,12 @@ fn zs2_evaluated_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyR
     Ok(())
 }
 
+/// Alias for `zs2_evaluated_params_to_parquet` with a clearer API name.
+#[pyfunction]
+fn zs2_export_enriched_params_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()> {
+    export_enriched_params_impl(input_zs2, output_parquet)
+}
+
 #[inline]
 fn ensure_len(want: usize, n: usize, at: usize) -> Res<()> {
     if want > n {
@@ -1788,7 +1824,22 @@ fn is_likely_value_leaf(leaf: &str) -> bool {
 /// Extract per-sample evaluated test results from:
 /// Document/Body/batch/Series/SeriesElements/Elem{sample}/.../EvalContext/ParamContext/ParameterListe/Elem{param}
 #[pyfunction]
-fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()> {
+fn zs2_parameterliste_results_to_parquet(
+    py: Python<'_>,
+    input_zs2: &str,
+    output_parquet: &str,
+) -> PyResult<()> {
+    emit_deprecation_warning(
+        py,
+        "zs2_parameterliste_results_to_parquet",
+        "zs2_export_sample_results_to_parquet",
+    )?;
+
+    export_sample_results_impl(input_zs2, output_parquet)
+}
+
+fn export_sample_results_impl(input_zs2: &str, output_parquet: &str) -> PyResult<()> {
+
     let data = read_zs2_with_limits(input_zs2)?;
 
     #[derive(Clone)]
@@ -2264,6 +2315,12 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
     Ok(())
 }
 
+/// Alias for `zs2_parameterliste_results_to_parquet` with a clearer API name.
+#[pyfunction]
+fn zs2_export_sample_results_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()> {
+    export_sample_results_impl(input_zs2, output_parquet)
+}
+
 fn infer_unit_from_channel_name(channel_name: &str) -> &'static str {
     let lower = channel_name.to_lowercase();
 
@@ -2301,5 +2358,7 @@ fn zs2fast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(zs2_channels_to_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(zs2_evaluated_params_to_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(zs2_parameterliste_results_to_parquet, m)?)?;
+    m.add_function(wrap_pyfunction!(zs2_export_enriched_params_to_parquet, m)?)?;
+    m.add_function(wrap_pyfunction!(zs2_export_sample_results_to_parquet, m)?)?;
     Ok(())
 }

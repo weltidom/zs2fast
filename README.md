@@ -52,17 +52,45 @@ print(channels.filter(pl.col('unit').is_not_null()).head())
 
 # Export calculated test results (Bruchbild, elongation, max force, etc.)
 # Units are resolved from EinheitName → QS_ValSetting blob → UnitTables
-zs2fast.zs2_evaluated_params_to_parquet("input.zs2", "evaluated_params.parquet")
+zs2fast.zs2_export_enriched_params_to_parquet("input.zs2", "evaluated_params.parquet")
 # columns: sample_idx, param_id, short_name, param_name, unit, value, value_text
 params = pl.read_parquet("evaluated_params.parquet")
 print(params.filter(pl.col('value').is_not_null()).head())
 
 # Extract per-sample test settings and parameters (not calculated results)
-zs2fast.zs2_parameterliste_results_to_parquet("input.zs2", "sample_params.parquet")
+zs2fast.zs2_export_sample_results_to_parquet("input.zs2", "sample_params.parquet")
 # columns: sample_id, result_id, result_name, unit, value_text, value
 sample_params = pl.read_parquet("sample_params.parquet")
 print(sample_params.head())
 ```
+
+## Which Parameter Export Should I Use?
+
+Both APIs read the per-sample `ParameterListe`, but they optimize for different goals.
+
+| Function | Primary goal | Output columns | Notes |
+|---|---|---|---|
+| `zs2_export_enriched_params_to_parquet` | Build a normalized parameter table with strong metadata enrichment | `sample_idx, param_id, short_name, param_name, unit, value, value_text` | Best for analysis tables where stable names/units matter most |
+| `zs2_export_sample_results_to_parquet` | Preserve per-sample result rows as stored/evaluated in `ParameterListe` | `sample_id, result_id, result_name, unit, value_text, value` | Includes branch-aware parsing to avoid nested/outer path collisions |
+
+### Practical Rule
+
+- Use `zs2_export_enriched_params_to_parquet` when you want a canonical analysis-ready parameter table.
+- Use `zs2_export_sample_results_to_parquet` when you want the closest representation of per-sample evaluated result entries.
+
+## Naming and Deprecation
+
+Preferred names:
+
+- `zs2_export_enriched_params_to_parquet`
+- `zs2_export_sample_results_to_parquet`
+
+Legacy names remain supported but now emit runtime `DeprecationWarning`:
+
+- `zs2_evaluated_params_to_parquet`
+- `zs2_parameterliste_results_to_parquet`
+
+Use the new names in notebooks and scripts going forward.
 
 ## Unit Resolution
 
