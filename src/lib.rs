@@ -1703,78 +1703,33 @@ fn decode_qs_valpar_f64(blob: &[u8]) -> Option<f64> {
     None
 }
 
-fn is_plausible_text_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || " äöüÄÖÜß_./:-+()[]{}%#".contains(c)
-}
-
 fn decode_qs_textpar(blob: &[u8]) -> Option<String> {
-    if blob.len() < 4 {
-        return None;
-    }
-
-    let mut best: Option<(i32, String)> = None;
-
-    for start in 0..(blob.len() - 1) {
-        let mut units: Vec<u16> = Vec::new();
-
-        for j in ((start)..(blob.len() - 1)).step_by(2) {
-            let u = u16::from_le_bytes([blob[j], blob[j + 1]]);
-            if u == 0 {
-                break;
+    // Deterministic format observed in QS_TextPar blobs:
+    // [type: u8][char_count: u32 with high-bit marker][utf16_text...][trailing metadata]
+    // Example: 01 49 00 00 80 <73 UTF-16 chars> 03 00 00 80 30 00 3a 00 64 00 ...
+    if blob.len() >= 5 {
+        let raw = u32::from_le_bytes([blob[1], blob[2], blob[3], blob[4]]);
+        let char_count = (raw & 0x7FFF_FFFF) as usize;
+        let need = char_count.saturating_mul(2);
+        if char_count > 0 && blob.len() >= 5 + need {
+            let text_bytes = &blob[5..5 + need];
+            if text_bytes.len().is_multiple_of(2) {
+                let mut units = Vec::with_capacity(text_bytes.len() / 2);
+                for c in text_bytes.chunks_exact(2) {
+                    units.push(u16::from_le_bytes([c[0], c[1]]));
+                }
+                let s = String::from_utf16_lossy(&units)
+                    .trim_end_matches('\0')
+                    .trim()
+                    .to_string();
+                if !s.is_empty() {
+                    return Some(s);
+                }
             }
-            units.push(u);
-            if units.len() >= 64 {
-                break;
-            }
-        }
-
-        if units.is_empty() {
-            continue;
-        }
-
-        // Use proper UTF-16 decoder that handles surrogate pairs
-        let decoded = String::from_utf16_lossy(&units);
-        let candidate = decoded.trim().to_string();
-
-        if candidate.len() < 2 {
-            continue;
-        }
-
-        // Check if all characters are plausible
-        if !candidate.chars().all(is_plausible_text_char) {
-            continue;
-        }
-
-        let has_alpha = candidate
-            .chars()
-            .any(|c| c.is_alphabetic() || "äöüÄÖÜß".contains(c));
-        if !has_alpha {
-            continue;
-        }
-
-        let mut score: i32 = 0;
-        if candidate.len() <= 10 {
-            score += 8;
-        }
-        if candidate.chars().all(|c| c.is_ascii_alphabetic()) {
-            score += 15;
-        }
-        if candidate.contains(':') {
-            score -= 8;
-        }
-        if candidate.to_lowercase().contains("1252:") {
-            score -= 20;
-        }
-        score -= candidate.len() as i32 / 2;
-
-        match &best {
-            None => best = Some((score, candidate)),
-            Some((best_score, _)) if score > *best_score => best = Some((score, candidate)),
-            _ => {}
         }
     }
 
-    best.map(|(_, s)| s)
+    None
 }
 
 fn decode_utf16le(bytes: &[u8]) -> Res<String> {
@@ -1818,47 +1773,12 @@ fn extract_sample_and_parameter_index(path: &str) -> Option<(u32, u32)> {
     Some((sample_idx, param_idx))
 }
 
-fn decode_first_utf16_segment_from_blob(blob: &[u8]) -> Option<String> {
-    if blob.len() < 4 {
-        return None;
-    }
-
-    for start in (0..blob.len() - 1).step_by(2) {
-        let mut units: Vec<u16> = Vec::new();
-        for j in (start..blob.len() - 1).step_by(2) {
-            let u = u16::from_le_bytes([blob[j], blob[j + 1]]);
-            if u == 0 {
-                break;
-            }
-            units.push(u);
-            if units.len() >= 128 {
-                break;
-            }
-        }
-
-        if units.len() < 2 {
-            continue;
-        }
-
-        // Use lossy decoder to properly handle surrogate pairs
-        let decoded = String::from_utf16_lossy(&units);
-        let trimmed = decoded.trim();
-        if trimmed.len() >= 2
-            && trimmed
-                .chars()
-                .any(|c| c.is_alphabetic() || "äöüÄÖÜß".contains(c))
-        {
-            return Some(trimmed.to_string());
-        }
-    }
-
-    None
-}
-
 fn decode_numeric_from_qs_valpar(blob: &[u8]) -> Option<f64> {
-    if blob.len() >= 8 {
+    // QS_ValPar format: [header_byte][f64_value][optional_text]
+    // The f64 is at offset 1, not 0
+    if blob.len() >= 9 {
         let v = f64::from_le_bytes([
-            blob[0], blob[1], blob[2], blob[3], blob[4], blob[5], blob[6], blob[7],
+            blob[1], blob[2], blob[3], blob[4], blob[5], blob[6], blob[7], blob[8],
         ]);
         if v.is_finite() && v.abs() < 1.0e15 && (v == 0.0 || v.abs() > 1.0e-100) {
             return Some(v);
@@ -1887,16 +1807,44 @@ fn is_likely_value_leaf(leaf: &str) -> bool {
 fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()> {
     let data = read_zs2_with_limits(input_zs2)?;
 
-    #[derive(Default, Clone)]
+    #[derive(Clone)]
     struct ResultData {
+        param_id: Option<u32>,
         name: String,
         unit: String,
         value_text: Option<String>,
         value_numeric: Option<f64>,
+        name_depth: usize,
+        unit_depth: usize,
+        text_depth: usize,
+        numeric_depth: usize,
+    }
+
+    impl Default for ResultData {
+        fn default() -> Self {
+            Self {
+                param_id: None,
+                name: String::new(),
+                unit: String::new(),
+                value_text: None,
+                value_numeric: None,
+                name_depth: usize::MAX,
+                unit_depth: usize::MAX,
+                text_depth: usize::MAX,
+                numeric_depth: usize::MAX,
+            }
+        }
+    }
+
+    #[derive(Default, Clone)]
+    struct GlobalDefData {
+        param_id: Option<u32>,
+        name: String,
+        unit: String,
     }
 
     let mut results_by_key: HashMap<(u32, u32), ResultData> = HashMap::new();
-    let mut global_param_defs: HashMap<u32, (String, String)> = HashMap::new();
+    let mut global_defs_by_elem: HashMap<u32, GlobalDefData> = HashMap::new();
 
     let mut i = 4usize;
     let n = data.len();
@@ -1924,6 +1872,7 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
 
         let dtype = data[i];
         let path = name_stack.join("/") + "/" + &name;
+        let path_depth = path.matches('/').count();
         let key = extract_sample_and_parameter_index(&path);
         let leaf = path.rsplit('/').next().unwrap_or("");
 
@@ -1952,34 +1901,28 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
                     let entry = results_by_key.entry(k).or_default();
                     let trimmed = text.trim();
                     if path.ends_with("/Name/Text") {
-                        if entry.name.is_empty() {
+                        if !trimmed.is_empty()
+                            && (entry.name.is_empty() || path_depth < entry.name_depth)
+                        {
                             entry.name = trimmed.to_string();
+                            entry.name_depth = path_depth;
                         }
                     } else if path.ends_with("/EinheitName") {
-                        if entry.unit.is_empty() {
+                        if !trimmed.is_empty()
+                            && (entry.unit.is_empty() || path_depth < entry.unit_depth)
+                        {
                             entry.unit = trimmed.to_string();
-                        }
-                    } else if is_likely_value_leaf(leaf) && !trimmed.is_empty() {
-                        if entry.value_text.is_none() {
-                            entry.value_text = Some(trimmed.to_string());
-                        }
-                        let normalized = trimmed.replace(',', ".");
-                        if entry.value_numeric.is_none() {
-                            if let Ok(v) = normalized.parse::<f64>() {
-                                entry.value_numeric = Some(v);
-                            }
+                            entry.unit_depth = path_depth;
                         }
                     }
                 } else if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/") {
                     if let Some(param_idx) = extract_elem_index(&path) {
-                        let def = global_param_defs
-                            .entry(param_idx)
-                            .or_insert((String::new(), String::new()));
+                        let def = global_defs_by_elem.entry(param_idx).or_default();
                         let trimmed = text.trim();
                         if path.ends_with("/Name/Text") && !trimmed.is_empty() {
-                            def.0 = trimmed.to_string();
+                            def.name = trimmed.to_string();
                         } else if path.ends_with("/EinheitName") && !trimmed.is_empty() {
-                            def.1 = trimmed.to_string();
+                            def.unit = trimmed.to_string();
                         }
                     }
                 }
@@ -1988,51 +1931,32 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
             0x22 => {
                 ensure_len(i + 1 + 4, n, i)?;
                 i += 1;
-                let val =
-                    i32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as f64;
+                let val = i32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
                 i += 4;
 
                 if let Some(k) = key {
-                    if is_likely_value_leaf(leaf) {
-                        results_by_key.entry(k).or_default().value_numeric = Some(val);
+                    if leaf.eq_ignore_ascii_case("ID") && val >= 0 {
+                        results_by_key.entry(k).or_default().param_id = Some(val as u32);
+                    }
+                } else if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/")
+                    && leaf.eq_ignore_ascii_case("ID")
+                    && val >= 0
+                {
+                    if let Some(param_idx) = extract_elem_index(&path) {
+                        global_defs_by_elem.entry(param_idx).or_default().param_id =
+                            Some(val as u32);
                     }
                 }
             }
 
             0x44 => {
                 ensure_len(i + 1 + 4, n, i)?;
-                i += 1;
-                let val =
-                    f32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as f64;
-                i += 4;
-
-                if let Some(k) = key {
-                    if is_likely_value_leaf(leaf) {
-                        results_by_key.entry(k).or_default().value_numeric = Some(val);
-                    }
-                }
+                i += 1 + 4;
             }
 
             0xCC => {
                 ensure_len(i + 1 + 8, n, i)?;
-                i += 1;
-                let val = f64::from_le_bytes([
-                    data[i],
-                    data[i + 1],
-                    data[i + 2],
-                    data[i + 3],
-                    data[i + 4],
-                    data[i + 5],
-                    data[i + 6],
-                    data[i + 7],
-                ]);
-                i += 8;
-
-                if let Some(k) = key {
-                    if is_likely_value_leaf(leaf) {
-                        results_by_key.entry(k).or_default().value_numeric = Some(val);
-                    }
-                }
+                i += 1 + 8;
             }
 
             0xDD => {
@@ -2082,19 +2006,19 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
                         let blob = &data[i..i + need];
                         let entry = results_by_key.entry(k).or_default();
 
-                        if leaf == "QS_TextPar" || leaf.contains("TextPar") {
-                            if let Some(decoded) = decode_first_utf16_segment_from_blob(blob) {
-                                if entry.value_text.is_none() {
+                        if leaf == "QS_TextPar" {
+                            if let Some(decoded) = decode_qs_textpar(blob) {
+                                if entry.value_text.is_none() || path_depth < entry.text_depth {
                                     entry.value_text = Some(decoded);
+                                    entry.text_depth = path_depth;
                                 }
                             }
-                        } else if leaf == "QS_ValPar" || leaf.contains("ValPar") {
-                            if entry.value_numeric.is_none() {
-                                entry.value_numeric = decode_numeric_from_qs_valpar(blob);
-                            }
-                            if entry.value_text.is_none() {
-                                if let Some(decoded) = decode_first_utf16_segment_from_blob(blob) {
-                                    entry.value_text = Some(decoded);
+                        } else if leaf == "QS_ValPar" {
+                            if let Some(v) = decode_numeric_from_qs_valpar(blob) {
+                                if entry.value_numeric.is_none() || path_depth < entry.numeric_depth
+                                {
+                                    entry.value_numeric = Some(v);
+                                    entry.numeric_depth = path_depth;
                                 }
                             }
                         }
@@ -2104,10 +2028,75 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
                 i += need;
             }
 
-            0x11 | 0x33 => i += 1 + 4,
-            0x55 | 0x66 => i += 1 + 2,
-            0x88 | 0x99 => i += 1 + 1,
-            0xBB => i += 1 + 4,
+            0x11 | 0x33 => {
+                ensure_len(i + 1 + 4, n, i)?;
+                i += 1;
+                let val = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                i += 4;
+
+                if let Some(k) = key {
+                    if leaf.eq_ignore_ascii_case("ID") {
+                        results_by_key.entry(k).or_default().param_id = Some(val);
+                    }
+                } else if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/")
+                    && leaf.eq_ignore_ascii_case("ID")
+                {
+                    if let Some(param_idx) = extract_elem_index(&path) {
+                        global_defs_by_elem.entry(param_idx).or_default().param_id = Some(val);
+                    }
+                }
+            }
+            0x55 | 0x66 => {
+                ensure_len(i + 1 + 2, n, i)?;
+                i += 1;
+                let val = u16::from_le_bytes([data[i], data[i + 1]]) as u32;
+                i += 2;
+
+                if leaf.eq_ignore_ascii_case("ID") {
+                    if let Some(k) = key {
+                        results_by_key.entry(k).or_default().param_id = Some(val);
+                    } else if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/")
+                    {
+                        if let Some(param_idx) = extract_elem_index(&path) {
+                            global_defs_by_elem.entry(param_idx).or_default().param_id = Some(val);
+                        }
+                    }
+                }
+            }
+            0x88 | 0x99 => {
+                ensure_len(i + 1 + 1, n, i)?;
+                i += 1;
+                let val = data[i] as u32;
+                i += 1;
+
+                if leaf.eq_ignore_ascii_case("ID") {
+                    if let Some(k) = key {
+                        results_by_key.entry(k).or_default().param_id = Some(val);
+                    } else if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/")
+                    {
+                        if let Some(param_idx) = extract_elem_index(&path) {
+                            global_defs_by_elem.entry(param_idx).or_default().param_id = Some(val);
+                        }
+                    }
+                }
+            }
+            0xBB => {
+                ensure_len(i + 1 + 4, n, i)?;
+                i += 1;
+                let val = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+                i += 4;
+
+                if leaf.eq_ignore_ascii_case("ID") {
+                    if let Some(k) = key {
+                        results_by_key.entry(k).or_default().param_id = Some(val);
+                    } else if path.contains("/Series/EvalContext/ParamContext/EigenschaftenListe/")
+                    {
+                        if let Some(param_idx) = extract_elem_index(&path) {
+                            global_defs_by_elem.entry(param_idx).or_default().param_id = Some(val);
+                        }
+                    }
+                }
+            }
 
             _ => {
                 return Err(Zs2Error::Parse {
@@ -2129,13 +2118,22 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
     let mut sorted_results: Vec<_> = results_by_key.into_iter().collect();
     sorted_results.sort_by_key(|((sample_id, result_id), _)| (*sample_id, *result_id));
 
-    for ((sample_id, result_id), result_data) in sorted_results {
+    let mut global_param_defs: HashMap<u32, (String, String)> = HashMap::new();
+    for def in global_defs_by_elem.values() {
+        if let Some(param_id) = def.param_id {
+            global_param_defs.insert(param_id, (def.name.clone(), def.unit.clone()));
+        }
+    }
+
+    for ((sample_id, elem_idx), result_data) in sorted_results {
+        let result_id = result_data.param_id.unwrap_or(elem_idx);
+
         let (def_name, def_unit) = global_param_defs
             .get(&result_id)
             .cloned()
             .unwrap_or((String::new(), String::new()));
 
-        let final_name = if result_data.name.is_empty() {
+        let mut final_name = if result_data.name.is_empty() {
             def_name
         } else {
             result_data.name.clone()
@@ -2146,9 +2144,11 @@ fn zs2_parameterliste_results_to_parquet(input_zs2: &str, output_parquet: &str) 
             result_data.unit.clone()
         };
 
-        if !final_name.is_empty()
-            && (result_data.value_numeric.is_some() || result_data.value_text.is_some())
-        {
+        if final_name.is_empty() {
+            final_name = format!("Param_{result_id}");
+        }
+
+        if result_data.value_numeric.is_some() || result_data.value_text.is_some() {
             sample_id_builder.append_value(sample_id);
             result_id_builder.append_value(result_id);
             result_name_builder.append_value(&final_name);
