@@ -1715,32 +1715,33 @@ fn decode_qs_textpar(blob: &[u8]) -> Option<String> {
     let mut best: Option<(i32, String)> = None;
 
     for start in 0..(blob.len() - 1) {
-        let mut chars: Vec<char> = Vec::new();
+        let mut units: Vec<u16> = Vec::new();
 
         for j in ((start)..(blob.len() - 1)).step_by(2) {
             let u = u16::from_le_bytes([blob[j], blob[j + 1]]);
             if u == 0 {
                 break;
             }
-            if let Some(c) = char::from_u32(u as u32) {
-                if !is_plausible_text_char(c) {
-                    break;
-                }
-                chars.push(c);
-                if chars.len() >= 64 {
-                    break;
-                }
-            } else {
+            units.push(u);
+            if units.len() >= 64 {
                 break;
             }
         }
 
-        if chars.is_empty() {
+        if units.is_empty() {
             continue;
         }
 
-        let candidate: String = chars.iter().collect::<String>().trim().to_string();
+        // Use proper UTF-16 decoder that handles surrogate pairs
+        let decoded = String::from_utf16_lossy(&units);
+        let candidate = decoded.trim().to_string();
+
         if candidate.len() < 2 {
+            continue;
+        }
+
+        // Check if all characters are plausible
+        if !candidate.chars().all(is_plausible_text_char) {
             continue;
         }
 
