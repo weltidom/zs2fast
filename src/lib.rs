@@ -804,39 +804,35 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                     let blob = &data[i..i + need];
 
                     // Resolve name and unit on first encounter of this channel
-                    let entry =
-                        channel_data
-                            .entry((sample_idx, ch_idx))
-                            .or_insert_with(|| {
-                                let key = format!("sample_{}/ch_{}", sample_idx, ch_idx);
-                                let trs_id = channel_trs_ids.get(&key).copied();
-                                let ch_name = if let Some(tid) = trs_id {
-                                    trs_to_name
-                                        .get(&tid)
-                                        .cloned()
-                                        .unwrap_or_else(|| format!("Ch{}", ch_idx))
-                                } else {
-                                    format!("Ch{}", ch_idx)
-                                };
-                                let unit = if let Some(tid) = trs_id {
-                                    let explicit =
-                                        trs_to_unit.get(&tid).cloned().unwrap_or_default();
-                                    if explicit.trim().is_empty() {
-                                        infer_unit_from_channel_name(&ch_name).to_string()
-                                    } else {
-                                        explicit
-                                    }
-                                } else {
-                                    infer_unit_from_channel_name(&ch_name).to_string()
-                                };
-                                ChannelDataEntry {
-                                    ch_name,
-                                    unit,
-                                    timepoints: None,
-                                    values: None,
-                                    data_type: "f32",
-                                }
-                            });
+                    let entry = channel_data.entry((sample_idx, ch_idx)).or_insert_with(|| {
+                        let key = format!("sample_{}/ch_{}", sample_idx, ch_idx);
+                        let trs_id = channel_trs_ids.get(&key).copied();
+                        let ch_name = if let Some(tid) = trs_id {
+                            trs_to_name
+                                .get(&tid)
+                                .cloned()
+                                .unwrap_or_else(|| format!("Ch{}", ch_idx))
+                        } else {
+                            format!("Ch{}", ch_idx)
+                        };
+                        let unit = if let Some(tid) = trs_id {
+                            let explicit = trs_to_unit.get(&tid).cloned().unwrap_or_default();
+                            if explicit.trim().is_empty() {
+                                infer_unit_from_channel_name(&ch_name).to_string()
+                            } else {
+                                explicit
+                            }
+                        } else {
+                            infer_unit_from_channel_name(&ch_name).to_string()
+                        };
+                        ChannelDataEntry {
+                            ch_name,
+                            unit,
+                            timepoints: None,
+                            values: None,
+                            data_type: "f32",
+                        }
+                    });
 
                     match sub {
                         0x0016 => {
