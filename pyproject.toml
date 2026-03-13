@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "zs2fast"
-version = "0.6.0"
+version = "0.6.1"
 description = "Fast Rust/PyO3 parser for ZS2 files with Parquet export"
 readme = "README.md"
 license = { file = "LICENSE" }
