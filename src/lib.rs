@@ -719,16 +719,19 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
     }
 
     // ===== PASS 2: Extract channel data with semantic names =====
+    // Accumulate u32 (time axis) and f32/f64 (values) per channel separately,
+    // then pair them up so `timepoint` holds the real timestamps from the u32 block.
     i = 4;
     name_stack.clear();
 
-    let mut sample_idx_builder = UInt32Builder::new();
-    let mut channel_idx_builder = UInt32Builder::new();
-    let mut channel_name_builder = StringBuilder::new();
-    let mut unit_name_builder = StringBuilder::new();
-    let mut timepoint_builder = UInt32Builder::new();
-    let mut value_builder = Float64Builder::new();
-    let mut data_type_builder = StringBuilder::new();
+    struct ChannelDataEntry {
+        ch_name: String,
+        unit: String,
+        timepoints: Option<Vec<u32>>, // decoded from u32 (0x0016) EE block = real time axis
+        values: Option<Vec<f64>>,     // decoded from f32/f64 (0x0004/0x0005) EE block
+        data_type: &'static str,      // "f32" or "f64"
+    }
+    let mut channel_data: HashMap<(u32, u32), ChannelDataEntry> = HashMap::new();
 
     while i < n {
         if data[i] == 0xFF {
@@ -779,12 +782,12 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                     extract_sample_index(&path),
                     extract_data_channel_index(&path),
                 ) {
-                    let (data_type_name, bytes_per_item) = match sub {
-                        0x0004 => ("f32", 4usize),
-                        0x0005 => ("f64", 8usize),
-                        0x0016 => ("u32", 4usize),
-                        0x0011 => ("u8", 1usize),
-                        0x0000 => ("empty", 0usize),
+                    let bytes_per_item: usize = match sub {
+                        0x0004 => 4,
+                        0x0005 => 8,
+                        0x0016 => 4,
+                        0x0011 => 1,
+                        0x0000 => 0,
                         _ => {
                             return Err(Zs2Error::Parse {
                                 offset: i,
@@ -800,83 +803,85 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                     ensure_len(i + need, n, i)?;
                     let blob = &data[i..i + need];
 
-                    // Look up channel name from TrsChannelId
-                    let key = format!("sample_{}/ch_{}", sample_idx, ch_idx);
-                    let trs_id = channel_trs_ids.get(&key).copied();
-                    let ch_name = if let Some(tid) = trs_id {
-                        trs_to_name
-                            .get(&tid)
-                            .cloned()
-                            .unwrap_or_else(|| format!("Ch{}", ch_idx))
-                    } else {
-                        format!("Ch{}", ch_idx)
-                    };
+                    // Resolve name and unit on first encounter of this channel
+                    let entry =
+                        channel_data
+                            .entry((sample_idx, ch_idx))
+                            .or_insert_with(|| {
+                                let key = format!("sample_{}/ch_{}", sample_idx, ch_idx);
+                                let trs_id = channel_trs_ids.get(&key).copied();
+                                let ch_name = if let Some(tid) = trs_id {
+                                    trs_to_name
+                                        .get(&tid)
+                                        .cloned()
+                                        .unwrap_or_else(|| format!("Ch{}", ch_idx))
+                                } else {
+                                    format!("Ch{}", ch_idx)
+                                };
+                                let unit = if let Some(tid) = trs_id {
+                                    let explicit =
+                                        trs_to_unit.get(&tid).cloned().unwrap_or_default();
+                                    if explicit.trim().is_empty() {
+                                        infer_unit_from_channel_name(&ch_name).to_string()
+                                    } else {
+                                        explicit
+                                    }
+                                } else {
+                                    infer_unit_from_channel_name(&ch_name).to_string()
+                                };
+                                ChannelDataEntry {
+                                    ch_name,
+                                    unit,
+                                    timepoints: None,
+                                    values: None,
+                                    data_type: "f32",
+                                }
+                            });
 
-                    // Look up unit name from TrsChannelId -> unit_names
-                    let unit = if let Some(tid) = trs_id {
-                        let explicit = trs_to_unit.get(&tid).cloned().unwrap_or_default();
-                        if explicit.trim().is_empty() {
-                            infer_unit_from_channel_name(&ch_name).to_string()
-                        } else {
-                            explicit
+                    match sub {
+                        0x0016 => {
+                            // u32 block = actual time axis; store as timepoints
+                            let mut tps = Vec::with_capacity(cnt as usize);
+                            for chunk in blob.chunks(4) {
+                                if chunk.len() == 4 {
+                                    tps.push(u32::from_le_bytes([
+                                        chunk[0], chunk[1], chunk[2], chunk[3],
+                                    ]));
+                                }
+                            }
+                            entry.timepoints = Some(tps);
                         }
-                    } else {
-                        infer_unit_from_channel_name(&ch_name).to_string()
-                    };
-
-                    if bytes_per_item == 0 {
-                        i += need;
-                        continue;
-                    }
-
-                    // Extract values
-                    for (tp, chunk) in blob.chunks(bytes_per_item).enumerate() {
-                        let value = match sub {
-                            0x0004 => {
-                                if chunk.len() >= 4 {
+                        0x0004 => {
+                            // f32 measurement values
+                            let mut vals = Vec::with_capacity(cnt as usize);
+                            for chunk in blob.chunks(4) {
+                                vals.push(if chunk.len() == 4 {
                                     f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
                                         as f64
                                 } else {
                                     f64::NAN
-                                }
+                                });
                             }
-                            0x0005 => {
-                                if chunk.len() >= 8 {
+                            entry.values = Some(vals);
+                            entry.data_type = "f32";
+                        }
+                        0x0005 => {
+                            // f64 measurement values
+                            let mut vals = Vec::with_capacity(cnt as usize);
+                            for chunk in blob.chunks(8) {
+                                vals.push(if chunk.len() == 8 {
                                     f64::from_le_bytes([
                                         chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5],
                                         chunk[6], chunk[7],
                                     ])
                                 } else {
                                     f64::NAN
-                                }
+                                });
                             }
-                            0x0016 => {
-                                if chunk.len() >= 4 {
-                                    u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
-                                        as f64
-                                } else {
-                                    f64::NAN
-                                }
-                            }
-                            0x0011 => {
-                                if !chunk.is_empty() {
-                                    chunk[0] as f64
-                                } else {
-                                    f64::NAN
-                                }
-                            }
-                            _ => f64::NAN,
-                        };
-
-                        if value.is_finite() {
-                            sample_idx_builder.append_value(sample_idx);
-                            channel_idx_builder.append_value(ch_idx);
-                            channel_name_builder.append_value(&ch_name);
-                            unit_name_builder.append_value(&unit);
-                            timepoint_builder.append_value(tp as u32);
-                            value_builder.append_value(value);
-                            data_type_builder.append_value(data_type_name);
+                            entry.values = Some(vals);
+                            entry.data_type = "f64";
                         }
+                        _ => {} // u8 (0x0011) and empty (0x0000): nothing to store
                     }
 
                     i += need;
@@ -953,6 +958,46 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                     .into())
                 }
             }
+        }
+    }
+
+    // Pair accumulated timepoints (u32 block) with values (f32/f64 block) and emit rows.
+    // timepoint now holds the real measurement timestamps, not just array indices.
+    // Sort by (sample_idx, channel_idx) for a stable output order.
+    let mut sample_idx_builder = UInt32Builder::new();
+    let mut channel_idx_builder = UInt32Builder::new();
+    let mut channel_name_builder = StringBuilder::new();
+    let mut unit_name_builder = StringBuilder::new();
+    let mut timepoint_builder = UInt32Builder::new();
+    let mut value_builder = Float64Builder::new();
+    let mut data_type_builder = StringBuilder::new();
+
+    let mut sorted_keys: Vec<(u32, u32)> = channel_data.keys().cloned().collect();
+    sorted_keys.sort();
+
+    for (sample_idx, ch_idx) in &sorted_keys {
+        let entry = &channel_data[&(*sample_idx, *ch_idx)];
+        let values = match &entry.values {
+            Some(v) => v,
+            None => continue, // channel had no f32/f64 block; nothing to emit
+        };
+        for (idx, &value) in values.iter().enumerate() {
+            if !value.is_finite() {
+                continue;
+            }
+            // Use real timestamp from u32 block if available, otherwise fall back to array index
+            let tp = entry
+                .timepoints
+                .as_ref()
+                .and_then(|tps| tps.get(idx).copied())
+                .unwrap_or(idx as u32);
+            sample_idx_builder.append_value(*sample_idx);
+            channel_idx_builder.append_value(*ch_idx);
+            channel_name_builder.append_value(&entry.ch_name);
+            unit_name_builder.append_value(&entry.unit);
+            timepoint_builder.append_value(tp);
+            value_builder.append_value(value);
+            data_type_builder.append_value(entry.data_type);
         }
     }
 
