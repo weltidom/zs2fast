@@ -14,10 +14,10 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: '3.11'
 
@@ -33,7 +33,7 @@ jobs:
     - name: Upload wheels (attempt 1)
       id: upload_wheels_1
       continue-on-error: true
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: wheels-${{ matrix.os }}
         path: dist/*.whl
@@ -43,7 +43,7 @@ jobs:
     - name: Upload wheels (attempt 2)
       id: upload_wheels_2
       if: steps.upload_wheels_1.outcome == 'failure'
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: wheels-${{ matrix.os }}
         path: dist/*.whl
@@ -60,10 +60,10 @@ jobs:
     name: Build source distribution
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: '3.11'
 
@@ -79,7 +79,7 @@ jobs:
     - name: Upload sdist (attempt 1)
       id: upload_sdist_1
       continue-on-error: true
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: sdist
         path: dist/*.tar.gz
@@ -89,7 +89,7 @@ jobs:
     - name: Upload sdist (attempt 2)
       id: upload_sdist_2
       if: steps.upload_sdist_1.outcome == 'failure'
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: sdist
         path: dist/*.tar.gz
@@ -114,7 +114,7 @@ jobs:
 
     steps:
     - name: Download all artifacts
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v5
       with:
         path: dist
         merge-multiple: true
