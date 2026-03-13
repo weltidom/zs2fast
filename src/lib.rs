@@ -800,6 +800,12 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                     ensure_len(i + need, n, i)?;
                     let blob = &data[i..i + need];
 
+                    // Export only signal payloads and skip side arrays such as ValidityArray.
+                    if !path.ends_with("/DataArray") {
+                        i += need;
+                        continue;
+                    }
+
                     // Look up channel name from TrsChannelId
                     let key = format!("sample_{}/ch_{}", sample_idx, ch_idx);
                     let trs_id = channel_trs_ids.get(&key).copied();
