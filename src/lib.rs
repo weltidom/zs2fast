@@ -719,8 +719,6 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
     }
 
     // ===== PASS 2: Extract channel data with semantic names =====
-    // Export only DataArray payloads as signal values.
-    // ValidityArray entries (often u32 status flags) are intentionally skipped.
     i = 4;
     name_stack.clear();
 
@@ -781,12 +779,12 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                     extract_sample_index(&path),
                     extract_data_channel_index(&path),
                 ) {
-                    let bytes_per_item: usize = match sub {
-                        0x0004 => 4,
-                        0x0005 => 8,
-                        0x0016 => 4,
-                        0x0011 => 1,
-                        0x0000 => 0,
+                    let (data_type_name, bytes_per_item) = match sub {
+                        0x0004 => ("f32", 4usize),
+                        0x0005 => ("f64", 8usize),
+                        0x0016 => ("u32", 4usize),
+                        0x0011 => ("u8", 1usize),
+                        0x0000 => ("empty", 0usize),
                         _ => {
                             return Err(Zs2Error::Parse {
                                 offset: i,
@@ -801,29 +799,6 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                     let need = (cnt as usize) * bytes_per_item;
                     ensure_len(i + need, n, i)?;
                     let blob = &data[i..i + need];
-
-                    // Only export signal arrays, skip validity/status side arrays.
-                    if !path.ends_with("/DataArray") {
-                        i += need;
-                        continue;
-                    }
-
-                    let data_type_name = match sub {
-                        0x0004 => "f32",
-                        0x0005 => "f64",
-                        0x0016 => "u32",
-                        0x0011 => "u8",
-                        0x0000 => "empty",
-                        _ => {
-                            return Err(Zs2Error::Parse {
-                                offset: i,
-                                msg: format!(
-                                    "Unknown EE subtype 0x{sub:04X} in channel block at path {path}"
-                                ),
-                            }
-                            .into());
-                        }
-                    };
 
                     // Look up channel name from TrsChannelId
                     let key = format!("sample_{}/ch_{}", sample_idx, ch_idx);
@@ -854,6 +829,7 @@ fn zs2_channels_to_parquet(input_zs2: &str, output_parquet: &str) -> PyResult<()
                         continue;
                     }
 
+                    // Extract values
                     for (tp, chunk) in blob.chunks(bytes_per_item).enumerate() {
                         let value = match sub {
                             0x0004 => {
